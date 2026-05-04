@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data — large downloaded files
+data/osm/
+data/graph-cache/
+data/dem/*.tif
+data/dem/download.log
+
+# GraphHopper
+graphhopper/*.jar
+graphhopper/graphhopper.log

@@ -1,0 +1,10 @@
+services:
+  graphhopper:
+    image: graphhopper/graphhopper:latest
+    volumes:
+      - ./graphhopper/config.yml:/graphhopper/config.yml
+      - ./data:/data
+    ports:
+      - "8989:8989"
+    environment:
+      - JAVA_OPTS=-Xmx4g -Xms512m
