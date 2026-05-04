@@ -12,3 +12,13 @@ graphhopper:
     - profile: car
 
   import.osm.ignored_highways: footway,construction,cycleway,path,steps
+
+server:
+  application_connectors:
+    - type: http
+      port: 2027
+      bind_host: localhost
+  admin_connectors:
+    - type: http
+      port: 2028
+      bind_host: localhost

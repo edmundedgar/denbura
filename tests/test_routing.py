@@ -3,7 +3,7 @@
 import pytest
 import requests
 
-GH_URL = "http://localhost:8080"
+GH_URL = "http://localhost:2027"
 
 # Mashiko, Tochigi (home base)
 MASHIKO = (36.476, 140.089)
