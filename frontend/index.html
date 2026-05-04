@@ -34,10 +34,15 @@
   <div id="map"></div>
 
   <script>
-    const GH = "gh";
+    const GH        = "gh";
     const NOMINATIM = "https://nominatim.openstreetmap.org/search";
 
+    const MAX_ROUTES    = 3;
+    const COLOR_PRIMARY = "#0078d4";
+    const COLOR_ALT     = "#999";
+
     let focusedInput = "to";
+    let primaryIndex = 0;
 
     const map = new maplibregl.Map({
       container: "map",
@@ -49,31 +54,97 @@
     map.addControl(new maplibregl.NavigationControl());
 
     map.on("click", (e) => {
+      // Don't populate input if the click landed on a route line
+      const hit = map.queryRenderedFeatures(e.point, {
+        layers: Array.from({ length: MAX_ROUTES }, (_, i) => `route-${i}`),
+      });
+      if (hit.length) return;
       const { lat, lng } = e.lngLat;
       document.getElementById(focusedInput).value =
         `${lat.toFixed(5)},${lng.toFixed(5)}`;
     });
 
     map.on("load", () => {
-      map.addSource("route", { type: "geojson", data: emptyLine() });
-      map.addLayer({
-        id: "route-line",
-        type: "line",
-        source: "route",
-        layout: { "line-join": "round", "line-cap": "round" },
-        paint: { "line-color": "#0078d4", "line-width": 4 },
-      });
+      // Add alternatives first so primary renders on top
+      for (let i = MAX_ROUTES - 1; i >= 0; i--) {
+        map.addSource(`route-${i}`, { type: "geojson", data: emptyGeoJSON() });
+        map.addLayer({
+          id: `route-${i}`,
+          type: "line",
+          source: `route-${i}`,
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: {
+            "line-color": i === 0 ? COLOR_PRIMARY : COLOR_ALT,
+            "line-width": i === 0 ? 4 : 3,
+            "line-opacity": i === 0 ? 1 : 0.6,
+          },
+        });
+      }
+
+      for (let i = 0; i < MAX_ROUTES; i++) {
+        map.on("mouseenter", `route-${i}`, () => {
+          if (i !== primaryIndex) map.getCanvas().style.cursor = "pointer";
+        });
+        map.on("mouseleave", `route-${i}`, () => {
+          map.getCanvas().style.cursor = "";
+        });
+        if (i > 0) {
+          map.on("click", `route-${i}`, () => promote(i));
+        }
+      }
     });
 
-    function emptyLine() {
+    function emptyGeoJSON() {
       return { type: "FeatureCollection", features: [] };
     }
 
+    function setRoute(index, coords) {
+      map.getSource(`route-${index}`).setData({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: coords },
+      });
+    }
+
+    function clearRoutes() {
+      for (let i = 0; i < MAX_ROUTES; i++) {
+        map.getSource(`route-${i}`).setData(emptyGeoJSON());
+      }
+      // Reset all styles to defaults
+      promote(0, true);
+    }
+
+    function promote(index, silent = false) {
+      if (!silent) {
+        map.setPaintProperty(`route-${primaryIndex}`, "line-color", COLOR_ALT);
+        map.setPaintProperty(`route-${primaryIndex}`, "line-width", 3);
+        map.setPaintProperty(`route-${primaryIndex}`, "line-opacity", 0.6);
+      }
+      map.setPaintProperty(`route-${index}`, "line-color", COLOR_PRIMARY);
+      map.setPaintProperty(`route-${index}`, "line-width", 4);
+      map.setPaintProperty(`route-${index}`, "line-opacity", 1);
+      map.moveLayer(`route-${index}`);
+      primaryIndex = index;
+    }
+
+    function fitToCoords(coords) {
+      const bounds = coords.reduce(
+        (b, c) => b.extend(c),
+        new maplibregl.LngLatBounds(coords[0], coords[0])
+      );
+      map.fitBounds(bounds, { padding: 60 });
+    }
+
+    function summarise(path) {
+      const km   = (path.distance / 1000).toFixed(1);
+      const mins = Math.round(path.time / 60000);
+      const h = Math.floor(mins / 60), m = mins % 60;
+      const time = h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+      return `${km} km · ${time}`;
+    }
+
     async function resolve(query) {
-      // Use as coordinates if it looks like "number,number"
       const m = query.match(/^(-?\d+\.?\d*),\s*(-?\d+\.?\d*)$/);
       if (m) return [parseFloat(m[1]), parseFloat(m[2])];
-
       const params = new URLSearchParams({
         q: query, format: "json", countrycodes: "jp", limit: 1,
       });
@@ -84,10 +155,30 @@
       return [parseFloat(results[0].lat), parseFloat(results[0].lon)];
     }
 
+    function routeParams(from, to, extra = {}) {
+      const p = new URLSearchParams({ profile: "car", points_encoded: "false", ...extra });
+      p.append("point", `${from[0]},${from[1]}`);
+      p.append("point", `${to[0]},${to[1]}`);
+      return p;
+    }
+
+    async function fetchAlternatives(from, to) {
+      const r = await fetch(`${GH}/route?` + routeParams(from, to, {
+        algorithm: "alternative_route",
+        "alternative_route.max_paths": MAX_ROUTES,
+      }));
+      if (!r.ok) return;
+      const data = await r.json();
+      // paths[0] duplicates the primary we already drew — skip it
+      for (let i = 1; i < data.paths.length; i++) {
+        setRoute(i, data.paths[i].points.coordinates);
+      }
+    }
+
     async function getRoute() {
-      const status = document.getElementById("status");
-      const fromVal = document.getElementById("from").value.trim();
-      const toVal   = document.getElementById("to").value.trim();
+      const status   = document.getElementById("status");
+      const fromVal  = document.getElementById("from").value.trim();
+      const toVal    = document.getElementById("to").value.trim();
 
       status.textContent = "Geocoding…";
       let from, to;
@@ -98,14 +189,13 @@
         return;
       }
 
-      status.textContent = "Routing…";
-      const params = new URLSearchParams({ profile: "car", points_encoded: "false" });
-      params.append("point", `${from[0]},${from[1]}`);
-      params.append("point", `${to[0]},${to[1]}`);
+      clearRoutes();
+      primaryIndex = 0;
 
+      status.textContent = "Routing…";
       let data;
       try {
-        const r = await fetch(`${GH}/route?${params}`);
+        const r = await fetch(`${GH}/route?` + routeParams(from, to));
         if (!r.ok) throw new Error(`GraphHopper error ${r.status}`);
         data = await r.json();
       } catch (e) {
@@ -114,24 +204,12 @@
       }
 
       const path = data.paths[0];
-      const coords = path.points.coordinates;
+      setRoute(0, path.points.coordinates);
+      fitToCoords(path.points.coordinates);
+      status.textContent = summarise(path);
 
-      map.getSource("route").setData({
-        type: "Feature",
-        geometry: { type: "LineString", coordinates: coords },
-      });
-
-      const bounds = coords.reduce(
-        (b, c) => b.extend(c),
-        new maplibregl.LngLatBounds(coords[0], coords[0])
-      );
-      map.fitBounds(bounds, { padding: 60 });
-
-      const km = (path.distance / 1000).toFixed(1);
-      const mins = Math.round(path.time / 60000);
-      const h = Math.floor(mins / 60), m = mins % 60;
-      const time = h ? `${h}h ${String(m).padStart(2,"0")}m` : `${m}m`;
-      status.textContent = `${km} km · ${time}`;
+      // Fetch alternatives without awaiting — populates when ready
+      fetchAlternatives(from, to);
     }
   </script>
 </body>
