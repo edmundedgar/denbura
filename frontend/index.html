@@ -26,8 +26,8 @@
 </head>
 <body>
   <div id="controls">
-    <input id="from" value="益子" placeholder="from — place name or lat,lon">
-    <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon">
+    <input id="from" value="益子" placeholder="from — place name or lat,lon" onfocus="focusedInput='from'">
+    <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon"  onfocus="focusedInput='to'">
     <button onclick="getRoute()">Route</button>
     <span id="status"></span>
   </div>
@@ -37,6 +37,8 @@
     const GH = "gh";
     const NOMINATIM = "https://nominatim.openstreetmap.org/search";
 
+    let focusedInput = "to";
+
     const map = new maplibregl.Map({
       container: "map",
       style: "https://tiles.openfreemap.org/styles/liberty",
@@ -45,6 +47,12 @@
     });
 
     map.addControl(new maplibregl.NavigationControl());
+
+    map.on("click", (e) => {
+      const { lat, lng } = e.lngLat;
+      document.getElementById(focusedInput).value =
+        `${lat.toFixed(5)},${lng.toFixed(5)}`;
+    });
 
     map.on("load", () => {
       map.addSource("route", { type: "geojson", data: emptyLine() });
