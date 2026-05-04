@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>EV Route Planner</title>
+  <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { display: flex; flex-direction: column; height: 100vh; font-family: sans-serif; }
+    #controls {
+      display: flex; gap: 8px; padding: 10px;
+      background: #fff; border-bottom: 1px solid #ddd; flex-shrink: 0;
+    }
+    #controls input {
+      flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px;
+    }
+    #controls button {
+      padding: 6px 16px; background: #0078d4; color: #fff;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
+    }
+    #controls button:hover { background: #005fa3; }
+    #status { font-size: 13px; color: #555; align-self: center; white-space: nowrap; }
+    #map { flex: 1; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input id="from" value="36.476,140.089" placeholder="from lat,lon">
+    <input id="to"   value="36.555,139.882" placeholder="to lat,lon">
+    <button onclick="getRoute()">Route</button>
+    <span id="status"></span>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    const GH = "gh";
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: "https://tiles.openfreemap.org/styles/liberty",
+      center: [140.089, 36.476],
+      zoom: 10,
+    });
+
+    map.addControl(new maplibregl.NavigationControl());
+
+    map.on("load", () => {
+      map.addSource("route", { type: "geojson", data: emptyLine() });
+      map.addLayer({
+        id: "route-line",
+        type: "line",
+        source: "route",
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: { "line-color": "#0078d4", "line-width": 4 },
+      });
+    });
+
+    function emptyLine() {
+      return { type: "FeatureCollection", features: [] };
+    }
+
+    function parsePoint(s) {
+      const [lat, lon] = s.split(",").map(Number);
+      if (isNaN(lat) || isNaN(lon)) throw new Error(`Invalid point: ${s}`);
+      return [lat, lon];
+    }
+
+    async function getRoute() {
+      const status = document.getElementById("status");
+      let from, to;
+      try {
+        from = parsePoint(document.getElementById("from").value.trim());
+        to   = parsePoint(document.getElementById("to").value.trim());
+      } catch (e) {
+        status.textContent = e.message;
+        return;
+      }
+
+      status.textContent = "Routing…";
+      const params = new URLSearchParams({
+        profile: "car",
+        points_encoded: "false",
+      });
+      params.append("point", `${from[0]},${from[1]}`);
+      params.append("point", `${to[0]},${to[1]}`);
+
+      let data;
+      try {
+        const r = await fetch(`${GH}/route?${params}`);
+        if (!r.ok) throw new Error(`GraphHopper error ${r.status}`);
+        data = await r.json();
+      } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+        return;
+      }
+
+      const path = data.paths[0];
+      const coords = path.points.coordinates; // [lon, lat] pairs
+
+      map.getSource("route").setData({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: coords },
+      });
+
+      const bounds = coords.reduce(
+        (b, c) => b.extend(c),
+        new maplibregl.LngLatBounds(coords[0], coords[0])
+      );
+      map.fitBounds(bounds, { padding: 60 });
+
+      const km = (path.distance / 1000).toFixed(1);
+      const mins = Math.round(path.time / 60000);
+      const h = Math.floor(mins / 60), m = mins % 60;
+      const time = h ? `${h}h ${String(m).padStart(2,"0")}m` : `${m}m`;
+      status.textContent = `${km} km · ${time}`;
+    }
+  </script>
+</body>
+</html>
