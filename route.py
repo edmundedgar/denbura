@@ -5,7 +5,7 @@ import argparse
 import sys
 import requests
 
-GH_URL = "http://localhost:8080"
+GH_URL = "http://localhost:2027"
 
 # Mashiko, Tochigi
 DEFAULT_FROM = "36.476,140.089"

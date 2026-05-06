@@ -1,0 +1,7 @@
+{
+  "speed": [
+    { "if": "road_class == TRUNK",                                                                    "limit_to": "20" },
+    { "if": "road_class == PRIMARY",                                                                  "limit_to": "15" },
+    { "if": "road_class != MOTORWAY && road_class != TRUNK && road_class != PRIMARY", "limit_to": "10" }
+  ]
+}

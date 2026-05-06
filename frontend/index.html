@@ -21,6 +21,15 @@
     }
     #controls button:hover { background: #005fa3; }
     #status { font-size: 13px; color: #555; align-self: center; white-space: nowrap; }
+    #route-list {
+      display: flex; gap: 6px; padding: 5px 10px; flex-wrap: wrap;
+      background: #f8f8f8; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; min-height: 32px;
+    }
+    .route-btn {
+      padding: 3px 10px; border-radius: 10px; font-size: 12px; cursor: pointer;
+      border: 1.5px solid #ccc; background: #fff; color: #666;
+    }
+    .route-btn.active { border-color: #0078d4; color: #0078d4; background: #e8f1fb; font-weight: 600; }
     #map { flex: 1; }
   </style>
 </head>
@@ -31,18 +40,23 @@
     <button onclick="getRoute()">Route</button>
     <span id="status"></span>
   </div>
+  <div id="route-list"></div>
   <div id="map"></div>
 
   <script>
     const GH        = "gh";
     const NOMINATIM = "https://nominatim.openstreetmap.org/search";
 
-    const MAX_ROUTES    = 3;
-    const COLOR_PRIMARY = "#0078d4";
-    const COLOR_ALT     = "#999";
+    const STRATEGIES = [
+      { profile: "car_motorway", label: "Exp",   color: "#0078d4", dimColor: "#90bfe8" },
+      { profile: "car_local",    label: "Local",  color: "#c47000", dimColor: "#dda860" },
+    ];
+
+    const MAX_ROUTES = 12;
 
     let focusedInput = "to";
     let primaryIndex = 0;
+    let routes = []; // [{coords, label, summary, strategyIndex}]
 
     const map = new maplibregl.Map({
       container: "map",
@@ -54,18 +68,14 @@
     map.addControl(new maplibregl.NavigationControl());
 
     map.on("click", (e) => {
-      // Don't populate input if the click landed on a route line
-      const hit = map.queryRenderedFeatures(e.point, {
-        layers: Array.from({ length: MAX_ROUTES }, (_, i) => `route-${i}`),
-      });
+      const layerIds = Array.from({length: MAX_ROUTES}, (_, i) => `route-${i}`);
+      const hit = map.queryRenderedFeatures(e.point, { layers: layerIds });
       if (hit.length) return;
       const { lat, lng } = e.lngLat;
-      document.getElementById(focusedInput).value =
-        `${lat.toFixed(5)},${lng.toFixed(5)}`;
+      document.getElementById(focusedInput).value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
     });
 
     map.on("load", () => {
-      // Add alternatives first so primary renders on top
       for (let i = MAX_ROUTES - 1; i >= 0; i--) {
         map.addSource(`route-${i}`, { type: "geojson", data: emptyGeoJSON() });
         map.addLayer({
@@ -73,24 +83,16 @@
           type: "line",
           source: `route-${i}`,
           layout: { "line-join": "round", "line-cap": "round" },
-          paint: {
-            "line-color": i === 0 ? COLOR_PRIMARY : COLOR_ALT,
-            "line-width": i === 0 ? 4 : 3,
-            "line-opacity": i === 0 ? 1 : 0.6,
-          },
+          paint: { "line-color": "#999", "line-width": 2, "line-opacity": 0 },
         });
       }
 
       for (let i = 0; i < MAX_ROUTES; i++) {
         map.on("mouseenter", `route-${i}`, () => {
-          if (i !== primaryIndex) map.getCanvas().style.cursor = "pointer";
+          if (routes[i] && i !== primaryIndex) map.getCanvas().style.cursor = "pointer";
         });
-        map.on("mouseleave", `route-${i}`, () => {
-          map.getCanvas().style.cursor = "";
-        });
-        if (i > 0) {
-          map.on("click", `route-${i}`, () => promote(i));
-        }
+        map.on("mouseleave", `route-${i}`, () => { map.getCanvas().style.cursor = ""; });
+        map.on("click", `route-${i}`, () => { if (routes[i] && i !== primaryIndex) promote(i); });
       }
     });
 
@@ -108,30 +110,28 @@
     function clearRoutes() {
       for (let i = 0; i < MAX_ROUTES; i++) {
         map.getSource(`route-${i}`).setData(emptyGeoJSON());
+        map.setPaintProperty(`route-${i}`, "line-opacity", 0);
       }
-      // Reset all styles to defaults
-      promote(0, true);
     }
 
-    function promote(index, silent = false) {
-      if (!silent) {
-        map.setPaintProperty(`route-${primaryIndex}`, "line-color", COLOR_ALT);
-        map.setPaintProperty(`route-${primaryIndex}`, "line-width", 3);
-        map.setPaintProperty(`route-${primaryIndex}`, "line-opacity", 0.6);
-      }
-      map.setPaintProperty(`route-${index}`, "line-color", COLOR_PRIMARY);
-      map.setPaintProperty(`route-${index}`, "line-width", 4);
-      map.setPaintProperty(`route-${index}`, "line-opacity", 1);
+    function styleRoute(index, active) {
+      const r = routes[index];
+      if (!r) return;
+      const s = STRATEGIES[r.strategyIndex];
+      map.setPaintProperty(`route-${index}`, "line-color", active ? s.color : s.dimColor);
+      map.setPaintProperty(`route-${index}`, "line-width", active ? 4 : 2);
+      map.setPaintProperty(`route-${index}`, "line-opacity", active ? 1 : 0.7);
+    }
+
+    function promote(index) {
+      styleRoute(primaryIndex, false);
+      styleRoute(index, true);
       map.moveLayer(`route-${index}`);
       primaryIndex = index;
-    }
-
-    function fitToCoords(coords) {
-      const bounds = coords.reduce(
-        (b, c) => b.extend(c),
-        new maplibregl.LngLatBounds(coords[0], coords[0])
-      );
-      map.fitBounds(bounds, { padding: 60 });
+      document.querySelectorAll(".route-btn").forEach((btn, i) => {
+        btn.classList.toggle("active", i === index);
+      });
+      document.getElementById("status").textContent = routes[index].summary;
     }
 
     function summarise(path) {
@@ -145,9 +145,7 @@
     async function resolve(query) {
       const m = query.match(/^(-?\d+\.?\d*),\s*(-?\d+\.?\d*)$/);
       if (m) return [parseFloat(m[1]), parseFloat(m[2])];
-      const params = new URLSearchParams({
-        q: query, format: "json", countrycodes: "jp", limit: 1,
-      });
+      const params = new URLSearchParams({ q: query, format: "json", countrycodes: "jp", limit: 1 });
       const r = await fetch(`${NOMINATIM}?${params}`);
       if (!r.ok) throw new Error(`Geocoding error ${r.status}`);
       const results = await r.json();
@@ -155,30 +153,50 @@
       return [parseFloat(results[0].lat), parseFloat(results[0].lon)];
     }
 
-    function routeParams(from, to, extra = {}) {
-      const p = new URLSearchParams({ profile: "car", points_encoded: "false", ...extra });
-      p.append("point", `${from[0]},${from[1]}`);
-      p.append("point", `${to[0]},${to[1]}`);
-      return p;
-    }
-
-    async function fetchAlternatives(from, to) {
-      const r = await fetch(`${GH}/route?` + routeParams(from, to, {
-        algorithm: "alternative_route",
-        "alternative_route.max_paths": MAX_ROUTES,
-      }));
-      if (!r.ok) return;
-      const data = await r.json();
-      // paths[0] duplicates the primary we already drew — skip it
-      for (let i = 1; i < data.paths.length; i++) {
-        setRoute(i, data.paths[i].points.coordinates);
+    async function fetchStrategy(from, to, strategyIndex) {
+      const s = STRATEGIES[strategyIndex];
+      try {
+        const r = await fetch(`${GH}/route`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            points: [[from[1], from[0]], [to[1], to[0]]],
+            profile: s.profile,
+            "ch.disable": true,
+            algorithm: "alternative_route",
+            "alternative_route.max_paths": 5,
+            "alternative_route.max_weight_factor": 3.0,
+            "alternative_route.max_share_factor": 0.6,
+            points_encoded: false,
+          }),
+        });
+        if (!r.ok) return [];
+        const data = await r.json();
+        return data.paths.map((path, j) => ({
+          coords:        path.points.coordinates,
+          summary:       summarise(path),
+          label:         j === 0 ? s.label : `${s.label} ${j + 1}`,
+          strategyIndex,
+        }));
+      } catch {
+        return [];
       }
     }
 
+    function fitToAllRoutes() {
+      const allCoords = routes.flatMap(r => r.coords);
+      if (!allCoords.length) return;
+      const bounds = allCoords.reduce(
+        (b, c) => b.extend(c),
+        new maplibregl.LngLatBounds(allCoords[0], allCoords[0])
+      );
+      map.fitBounds(bounds, { padding: 60 });
+    }
+
     async function getRoute() {
-      const status   = document.getElementById("status");
-      const fromVal  = document.getElementById("from").value.trim();
-      const toVal    = document.getElementById("to").value.trim();
+      const status  = document.getElementById("status");
+      const fromVal = document.getElementById("from").value.trim();
+      const toVal   = document.getElementById("to").value.trim();
 
       status.textContent = "Geocoding…";
       let from, to;
@@ -190,26 +208,33 @@
       }
 
       clearRoutes();
+      routes = [];
       primaryIndex = 0;
-
+      document.getElementById("route-list").innerHTML = "<span style='color:#999;font-size:12px'>Loading…</span>";
       status.textContent = "Routing…";
-      let data;
-      try {
-        const r = await fetch(`${GH}/route?` + routeParams(from, to));
-        if (!r.ok) throw new Error(`GraphHopper error ${r.status}`);
-        data = await r.json();
-      } catch (e) {
-        status.textContent = `Error: ${e.message}`;
+
+      const allResults = await Promise.all(STRATEGIES.map((_, i) => fetchStrategy(from, to, i)));
+      routes = allResults.flat().slice(0, MAX_ROUTES);
+
+      if (!routes.length) {
+        status.textContent = "No routes found";
+        document.getElementById("route-list").innerHTML = "";
         return;
       }
 
-      const path = data.paths[0];
-      setRoute(0, path.points.coordinates);
-      fitToCoords(path.points.coordinates);
-      status.textContent = summarise(path);
+      routes.forEach((r, i) => {
+        setRoute(i, r.coords);
+        styleRoute(i, i === 0);
+      });
 
-      // Fetch alternatives without awaiting — populates when ready
-      fetchAlternatives(from, to);
+      fitToAllRoutes();
+      status.textContent = routes[0].summary;
+
+      document.getElementById("route-list").innerHTML = routes.map((r, i) =>
+        `<button class="route-btn${i === 0 ? " active" : ""}" onclick="promote(${i})">
+           ${r.label} · ${r.summary}
+         </button>`
+      ).join("");
     }
   </script>
 </body>
