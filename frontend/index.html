@@ -94,7 +94,39 @@
         map.on("mouseleave", `route-${i}`, () => { map.getCanvas().style.cursor = ""; });
         map.on("click", `route-${i}`, () => { if (routes[i] && i !== primaryIndex) promote(i); });
       }
+
+      loadChargers();
     });
+
+    const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
+
+    async function loadChargers() {
+      const r = await fetch("flash_chargers.json");
+      const chargers = await r.json();
+      for (const c of chargers) {
+        const el = document.createElement("div");
+        el.style.cssText = [
+          "width:14px", "height:14px", "border-radius:50%",
+          "background:#00b300", "border:2px solid #fff",
+          "box-shadow:0 1px 3px rgba(0,0,0,.4)", "cursor:pointer",
+        ].join(";");
+
+        const lines = [
+          `<strong>${c.name}</strong>`,
+          c.address  ? c.address : null,
+          c.max_output ? `出力: ${c.max_output}` : null,
+          c.hours    ? `営業: ${c.hours}` : null,
+          c.closed   ? `定休: ${c.closed}` : null,
+          c.connector_types ? c.connector_types.join(" / ") : null,
+          c.status === "under_adjustment" ? "<em>調整中</em>" : null,
+        ].filter(Boolean).join("<br>");
+
+        new maplibregl.Marker({ element: el })
+          .setLngLat([c.lon, c.lat])
+          .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
+          .addTo(map);
+      }
+    }
 
     function emptyGeoJSON() {
       return { type: "FeatureCollection", features: [] };

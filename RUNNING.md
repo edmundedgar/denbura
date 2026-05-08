@@ -127,6 +127,26 @@ Once tiles exist the archive and CSV can be deleted to recover disk space.
 
 ---
 
+## Flash EV charger data
+
+`frontend/flash_chargers.json` — charger locations fetched from the Google My Maps
+embedded on `ev-charger.jp/area/`. Displayed as green markers on the map with a
+popup showing name, address, max output, hours, and connector types.
+
+Refresh with:
+
+```bash
+cd ~/working/denbura
+source ~/venvs/denbura/bin/activate
+python tools/extract_flash_chargers.py
+cp flash_chargers.json frontend/flash_chargers.json
+```
+
+The script fetches the KMZ from the embedded map (one request, ~40 KB) and parses
+coordinates and metadata directly from it. No geocoding needed.
+
+---
+
 ## OSM map data
 
 `data/osm/japan-latest.osm.pbf` — full Japan extract from Geofabrik.
