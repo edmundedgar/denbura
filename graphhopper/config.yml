@@ -1,5 +1,5 @@
 graphhopper:
-  datareader.file: /home/denbura/working/denbura/data/osm/kanto-latest.osm.pbf
+  datareader.file: /home/denbura/working/denbura/data/osm/japan-latest.osm.pbf
   graph.location: /home/denbura/working/denbura/data/graph-cache
 
   graph.encoded_values: car_access, car_average_speed, road_access, road_class

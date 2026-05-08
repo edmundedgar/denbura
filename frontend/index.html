@@ -134,12 +134,20 @@
       document.getElementById("status").textContent = routes[index].summary;
     }
 
-    function summarise(path) {
-      const km   = (path.distance / 1000).toFixed(1);
-      const mins = Math.round(path.time / 60000);
+    function fmtTime(ms) {
+      const mins = Math.round(ms / 60000);
       const h = Math.floor(mins / 60), m = mins % 60;
-      const time = h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
-      return `${km} km · ${time}`;
+      return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+    }
+
+    function summarise(path) {
+      const km = (path.distance / 1000).toFixed(1);
+      const ghTime = fmtTime(path.time);
+      if (path.scored_time_ms != null) {
+        const gpsTime = fmtTime(path.scored_time_ms);
+        return `${km} km · GH ${ghTime} / GPS ${gpsTime}`;
+      }
+      return `${km} km · ${ghTime}`;
     }
 
     async function resolve(query) {
