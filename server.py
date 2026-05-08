@@ -20,21 +20,51 @@ TILE_DIR = "planet_gps/tiles"
 RADIUS_M    = 50   # metres to search around each segment midpoint for GPS scoring
 MIN_SAMPLES =  5   # minimum GPS points needed to trust the estimate
 
-CHARGER_MAX_DIST_M = 20_000  # pre-filter: chargers within 20 km of route polyline
-DETOUR_MAX_RATIO   =   1.20  # keep via-charger routes up to 20% longer than direct
-MAX_CHARGER_ROUTES =      5  # cap on charger routes returned per request
+CLUSTER_RADIUS_M    =  3_000  # merge POIs within 3 km into one cluster
+DETOUR_MAX_RATIO    =   1.20  # keep via-POI routes up to 20% longer than direct
+MAX_CHARGER_ROUTES  =      5  # cap on charger routes returned per request
+MAX_CHARGER_GH_REQS =     15  # cap on GH requests fired per query
 
 app = FastAPI()
 
 # ---------------------------------------------------------------------------
-# Charger data (loaded once at startup)
+# POI data: load + cluster at startup
 # ---------------------------------------------------------------------------
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2)
+         * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+def _build_clusters(pois: list) -> list:
+    """Greedy single-linkage clustering: merge POIs within CLUSTER_RADIUS_M."""
+    clusters: list = []
+    for poi in pois:
+        lat_m = 111_320.0
+        lon_m = lat_m * math.cos(math.radians(poi["lat"]))
+        for c in clusters:
+            dy = (poi["lat"] - c["lat"]) * lat_m
+            dx = (poi["lon"] - c["lon"]) * lon_m
+            if math.hypot(dy, dx) <= CLUSTER_RADIUS_M:
+                c["members"].append(poi)
+                n = len(c["members"])
+                c["lat"] = sum(m["lat"] for m in c["members"]) / n
+                c["lon"] = sum(m["lon"] for m in c["members"]) / n
+                break
+        else:
+            clusters.append({"lat": poi["lat"], "lon": poi["lon"], "members": [poi]})
+    return clusters
 
 _CHARGER_FILE = "frontend/flash_chargers.json"
 _chargers: list = []
 if os.path.exists(_CHARGER_FILE):
     with open(_CHARGER_FILE, encoding="utf-8") as _f:
         _chargers = json.load(_f)
+_clusters: list = _build_clusters(_chargers)
+log.info(f"Loaded {len(_chargers)} chargers → {len(_clusters)} clusters")
 
 # ---------------------------------------------------------------------------
 # GPS tile loading
@@ -99,37 +129,16 @@ def _score_path(path: dict) -> int | None:
 # Charger routing helpers
 # ---------------------------------------------------------------------------
 
-def _chargers_near_path(coords: list) -> list:
-    """Return chargers within CHARGER_MAX_DIST_M of the route polyline."""
-    if not _chargers:
-        return []
-
-    mid_lat = sum(c[1] for c in coords) / len(coords)
-    lat_m = 111_320.0
-    lon_m = 111_320.0 * math.cos(math.radians(mid_lat))
-
-    route_yx = np.column_stack([
-        np.array([c[1] for c in coords], dtype=np.float32) * lat_m,
-        np.array([c[0] for c in coords], dtype=np.float32) * lon_m,
-    ])
-    tree = cKDTree(route_yx)
-
-    nearby = []
-    for c in _chargers:
-        cy = c["lat"] * lat_m
-        cx = c["lon"] * lon_m
-        dist, _ = tree.query([cy, cx])
-        if dist <= CHARGER_MAX_DIST_M:
-            nearby.append((dist, c))
-
-    nearby.sort()
-    return [c for _, c in nearby]
-
-
-async def _route_via_charger(client: httpx.AsyncClient, start_ll: list,
-                              charger: dict, end_ll: list, profile: str) -> dict | None:
+async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
+                              cluster: dict, end_ll: list, profile: str) -> dict | None:
+    # Route via the cluster member with the smallest straight-line detour
+    s_lat, s_lon = start_ll[1], start_ll[0]
+    e_lat, e_lon = end_ll[1], end_ll[0]
+    best = min(cluster["members"],
+               key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                           + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
     body = {
-        "points": [start_ll, [charger["lon"], charger["lat"]], end_ll],
+        "points": [start_ll, [best["lon"], best["lat"]], end_ll],
         "profile": profile,
         "ch.disable": True,
         "points_encoded": False,
@@ -145,11 +154,11 @@ async def _route_via_charger(client: httpx.AsyncClient, start_ll: list,
             return None
         path = paths[0]
         path["charger"] = {
-            "name":       charger["name"],
-            "max_output": charger.get("max_output", ""),
-            "address":    charger.get("address", ""),
-            "lat":        charger["lat"],
-            "lon":        charger["lon"],
+            "name":       best["name"],
+            "max_output": best.get("max_output", ""),
+            "address":    best.get("address", ""),
+            "lat":        best["lat"],
+            "lon":        best["lon"],
         }
         return path
     except Exception:
@@ -226,14 +235,26 @@ async def route(request: Request):
         # Via-charger routes (expressway profile only, single start/end only)
         if profile == "car_motorway" and len(body["points"]) == 2:
             direct_dist = paths[0]["distance"]
-            nearby      = _chargers_near_path(paths[0]["points"]["coordinates"])
-            t.mark(f"charger spatial filter ({len(nearby)} nearby)")
+            s_lat, s_lon = start_ll[1], start_ll[0]
+            e_lat, e_lon = end_ll[1], end_ll[0]
+            d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
+            d_max    = d_direct * DETOUR_MAX_RATIO
+
+            ranked = []
+            for c in _clusters:
+                da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
+                db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
+                if da + db <= d_max:
+                    ranked.append((da + db - d_direct, c))
+            ranked.sort()
+            nearby_clusters = [c for _, c in ranked][:MAX_CHARGER_GH_REQS]
+            t.mark(f"charger ellipse filter ({len(nearby_clusters)} clusters from {len(_clusters)})")
 
             charger_paths = await asyncio.gather(
-                *[_route_via_charger(client, start_ll, c, end_ll, profile)
-                  for c in nearby]
+                *[_route_via_cluster(client, start_ll, c, end_ll, profile)
+                  for c in nearby_clusters]
             )
-            t.mark(f"GH charger routes ({len(nearby)} requests)")
+            t.mark(f"GH charger routes ({len(nearby_clusters)} requests)")
 
             added = 0
             for cp in charger_paths:
