@@ -57,6 +57,8 @@
     let focusedInput = "to";
     let primaryIndex = 0;
     let routes = []; // [{coords, label, summary, strategyIndex}]
+    const chargerEls = new Map(); // "lat,lon" → marker element
+    let activeChargerEl = null;
 
     const map = new maplibregl.Map({
       container: "map",
@@ -125,6 +127,7 @@
           .setLngLat([c.lon, c.lat])
           .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
           .addTo(map);
+        chargerEls.set(`${c.lat},${c.lon}`, el);
       }
     }
 
@@ -143,6 +146,10 @@
       for (let i = 0; i < MAX_ROUTES; i++) {
         map.getSource(`route-${i}`).setData(emptyGeoJSON());
         map.setPaintProperty(`route-${i}`, "line-opacity", 0);
+      }
+      if (activeChargerEl) {
+        activeChargerEl.style.background = "#00b300";
+        activeChargerEl = null;
       }
     }
 
@@ -170,6 +177,16 @@
         btn.classList.toggle("active", i === index);
       });
       document.getElementById("status").textContent = routes[index].summary;
+
+      if (activeChargerEl) {
+        activeChargerEl.style.background = "#00b300";
+        activeChargerEl = null;
+      }
+      const c = routes[index]?.charger;
+      if (c) {
+        const el = chargerEls.get(`${c.lat},${c.lon}`);
+        if (el) { el.style.background = "#7b2fbe"; activeChargerEl = el; }
+      }
     }
 
     function fmtTime(ms) {

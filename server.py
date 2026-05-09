@@ -29,9 +29,16 @@ MAX_CHARGER_GH_REQS =     15  # cap on GH requests fired per query
 # Toll calculation constants
 # ---------------------------------------------------------------------------
 
-# NEXCO (most expressways outside Tokyo/Osaka): distance-based
-_NEXCO_TERMINAL  =  150   # ¥ fixed entry charge, 普通車
-_NEXCO_PER_KM    = 24.6   # ¥/km, 普通車
+# NEXCO (most expressways outside Tokyo/Osaka): distance-based with long-distance tiers
+# 長距離逓減割引, 普通車
+_NEXCO_TERMINAL  = 150    # ¥ fixed entry charge per expressway entry
+# (distance_km_threshold, discount_fraction) — applied to the portion within each band
+_NEXCO_TIERS = [
+    (  0, 0.00),   #   0–100 km: base rate
+    (100, 0.25),   # 100–200 km: 25% off
+    (200, 0.30),   # 200 km+:    30% off
+]
+_NEXCO_BASE_KM   = 24.6   # ¥/km before discount
 
 # Shutoko (首都高) — Tokyo metropolitan expressway: distance-based with cap
 _SHUTOKO_MIN     =  310   # ¥ minimum, 普通車 ETC
@@ -69,62 +76,75 @@ def _calc_toll(path: dict) -> int | None:
 
     coords = path["points"]["coordinates"]  # [lon, lat]
 
-    # Build per-coord-pair distance lookup
-    pair_dist = {fi: dm for fi, ti, dm in dist_segs}
-
-    # Build per-coord-pair road_class lookup (sparse — use range walk)
-    pair_class: dict[int, str] = {}
+    # Build per-coord-pair lookups
+    pair_dist  = {fi: dm  for fi, ti, dm  in dist_segs}
+    pair_toll  = {}
+    for fi, ti, tv in toll_segs:
+        for i in range(fi, ti):
+            pair_toll[i] = tv
+    pair_class = {}
     for fi, ti, cls in rc_segs:
         for i in range(fi, ti):
             pair_class[i] = cls
 
-    # Accumulate tolled distance per network
-    nexco_m    = 0.0
-    shutoko_m  = 0.0
-    hanshin_m  = 0.0
-    has_shutoko = False
-    has_hanshin = False
+    # Walk pairs in sequence, tracking network transitions to count entries
+    nexco_m       = 0.0
+    shutoko_m     = 0.0
+    hanshin_m     = 0.0
+    nexco_entries = 0
+    shutoko_seen  = False
+    hanshin_seen  = False
+    prev_network  = None   # last tolled network (None = not on toll road)
 
-    for fi, ti, toll_val in toll_segs:
-        if toll_val.lower() != "all":
+    for i in range(len(coords) - 1):
+        if pair_toll.get(i, "no").lower() != "all":
+            prev_network = None
             continue
-        for i in range(fi, ti):
-            cls = pair_class.get(i, "")
-            if cls not in ("motorway", "trunk"):
-                continue
-            dm = pair_dist.get(i, 0.0)
-            if dm == 0:
-                continue
-            # midpoint coordinate
-            if i < len(coords) - 1:
-                mlon = (coords[i][0] + coords[i+1][0]) * 0.5
-                mlat = (coords[i][1] + coords[i+1][1]) * 0.5
-            else:
-                mlon, mlat = coords[i]
-            network = _toll_network(mlat, mlon)
-            if network == "shutoko":
-                shutoko_m += dm
-                has_shutoko = True
-            elif network == "hanshin":
-                hanshin_m += dm
-                has_hanshin = True
-            else:
-                nexco_m += dm
+        cls = pair_class.get(i, "")
+        if cls not in ("motorway", "trunk"):
+            prev_network = None
+            continue
+        dm = pair_dist.get(i, 0.0)
+        mlon = (coords[i][0] + coords[i+1][0]) * 0.5
+        mlat = (coords[i][1] + coords[i+1][1]) * 0.5
+        network = _toll_network(mlat, mlon)
+
+        if network == "nexco":
+            if prev_network != "nexco":
+                nexco_entries += 1
+            nexco_m += dm
+        elif network == "shutoko":
+            shutoko_m += dm
+            shutoko_seen = True
+        elif network == "hanshin":
+            hanshin_m += dm
+            hanshin_seen = True
+
+        prev_network = network
 
     total = 0
 
     if nexco_m > 0:
-        raw = _NEXCO_TERMINAL + (nexco_m / 1000) * _NEXCO_PER_KM
+        km = nexco_m / 1000
+        dist_charge = 0.0
+        thresholds = [t for t, _ in _NEXCO_TIERS] + [float("inf")]
+        for j, (start_km, discount) in enumerate(_NEXCO_TIERS):
+            end_km = thresholds[j + 1]
+            portion = max(0.0, min(km, end_km) - start_km)
+            dist_charge += portion * _NEXCO_BASE_KM * (1 - discount)
+            if km <= end_km:
+                break
+        raw = _NEXCO_TERMINAL * nexco_entries + dist_charge
         total += math.ceil(raw / 10) * 10
 
-    if has_shutoko:
+    if shutoko_seen:
         raw = (shutoko_m / 1000) * _SHUTOKO_PER_KM
         total += max(_SHUTOKO_MIN, min(_SHUTOKO_MAX, math.ceil(raw / 10) * 10))
 
-    if has_hanshin:
+    if hanshin_seen:
         total += _HANSHIN_FLAT
 
-    return total if (nexco_m > 0 or has_shutoko or has_hanshin) else None
+    return total if (nexco_m > 0 or shutoko_seen or hanshin_seen) else None
 
 app = FastAPI()
 
