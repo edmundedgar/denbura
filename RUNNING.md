@@ -25,9 +25,14 @@ java -jar graphhopper/graphhopper-web-11.0.jar server graphhopper/config.yml
 Listens on **port 2027**. Reads the Japan OSM map (`data/osm/japan-latest.osm.pbf`)
 and custom routing profiles from `graphhopper/*.json`.
 
-**Graph cache** (`data/graph-cache/`): built on the first run after the OSM file or any
-profile changes (~30–60 min for Japan); subsequent starts load it in seconds.
-Delete the cache directory to force a rebuild.
+**Graph cache** (`data/graph-cache/`): built on the first run after the OSM file, any
+profile change, or any change to `graph.encoded_values` in `config.yml` (~30–60 min
+for Japan); subsequent starts load the cache in seconds. Delete the cache directory
+to force a rebuild.
+
+**Encoded values** (defined in `graphhopper/config.yml`): the graph currently encodes
+`car_access`, `car_average_speed`, `road_access`, `road_class`, and `toll`. Adding or
+removing an encoded value requires deleting `data/graph-cache/` and rebuilding.
 
 **Profiles** (defined in `graphhopper/config.yml`):
 - `car_motorway` — prefers expressways
@@ -48,18 +53,26 @@ uvicorn server:app --host 127.0.0.1 --port 2029
 
 Listens on **port 2029**. Sits between the frontend and GraphHopper:
 
-- Forwards route requests to GraphHopper, adding `details: [time, distance]` to get
-  per-segment data back.
-- Loads GPS speed tiles from `planet_gps/tiles/` (1°×1° `.npz` files) on demand and
-  caches them in memory for the lifetime of the process.
-- For each route segment, finds GPS trace speed samples within 50 m and computes a
-  median speed. If ≥5 samples exist, uses that to compute `scored_time_ms`; otherwise
-  falls back to GraphHopper's estimate.
-- Returns the original GraphHopper response augmented with `scored_time_ms` on each
-  path (the GPS-based time estimate in milliseconds).
+- Forwards route requests to GraphHopper, requesting `details: [time, distance,
+  road_class, toll]` to get per-segment data back.
+- Loads GPS speed tiles from `planet_gps/tiles/` (1°×1° `.npz` files) on demand,
+  builds a scipy `cKDTree` per tile, and caches both in memory for the lifetime of
+  the process. For each route segment, finds GPS trace speed samples within 50 m and
+  computes a median speed. If ≥5 samples exist, uses that to compute `scored_time_ms`;
+  otherwise falls back to GraphHopper's estimate.
+- Calculates expressway toll cost (`toll_jpy`) from per-segment `toll` and `road_class`
+  details. Applies NEXCO rates (¥24.6/km + ¥150 terminal charge, 普通車) for most
+  expressways; uses a distance-capped formula for the Shutoko (Tokyo metropolitan
+  expressway, min ¥310 / max ¥1,320) and a flat approximation for Hanshin (Osaka).
+  Urban networks are identified by geographic bounding box from the route coordinates.
+- For `car_motorway` routes, adds via-charger alternatives using Flash EV charger data.
+  Clusters chargers at startup, filters candidates with an ellipse pre-filter
+  (A→charger→B ≤ 120% of direct distance), and caps GH requests at 15 per query.
+- Returns the original GraphHopper response augmented with `scored_time_ms` and
+  `toll_jpy` on each path.
 
-Tiles are loaded on first request per region; subsequent requests for the same area
-are served from the in-process cache.
+Tiles and KDTrees are built on first request per 1°×1° region; subsequent requests
+for the same area are served from the in-process cache.
 
 ---
 
@@ -75,8 +88,10 @@ Listens on **port 2026**. Serves `frontend/index.html` — a MapLibre GL map wit
 - Geocoding via Nominatim (OSM)
 - Two routing profiles shown simultaneously: expressway (blue) and local (orange)
 - Up to 12 alternative routes displayed at once, clickable to promote
-- Route buttons show both GraphHopper time and GPS-estimated time when available:
-  `116.0 km · GH 2h05m / GPS 1h55m`
+- Route buttons show GraphHopper time, GPS-estimated time, and expressway toll:
+  `454.0 km · GH 5h53m / GPS 4h50m · ¥8,890`
+- Via-charger routes shown in purple with charger name and output in the label
+- Flash EV charger locations shown as green markers with popup details
 
 ---
 

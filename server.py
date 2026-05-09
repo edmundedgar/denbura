@@ -25,6 +25,107 @@ DETOUR_MAX_RATIO    =   1.20  # keep via-POI routes up to 20% longer than direct
 MAX_CHARGER_ROUTES  =      5  # cap on charger routes returned per request
 MAX_CHARGER_GH_REQS =     15  # cap on GH requests fired per query
 
+# ---------------------------------------------------------------------------
+# Toll calculation constants
+# ---------------------------------------------------------------------------
+
+# NEXCO (most expressways outside Tokyo/Osaka): distance-based
+_NEXCO_TERMINAL  =  150   # ¥ fixed entry charge, 普通車
+_NEXCO_PER_KM    = 24.6   # ¥/km, 普通車
+
+# Shutoko (首都高) — Tokyo metropolitan expressway: distance-based with cap
+_SHUTOKO_MIN     =  310   # ¥ minimum, 普通車 ETC
+_SHUTOKO_MAX     = 1320   # ¥ maximum (cap), 普通車 ETC
+_SHUTOKO_PER_KM  = 29.1   # ¥/km, 普通車
+
+# Hanshin (阪神) — Osaka: simplified flat approximation
+_HANSHIN_FLAT    =  630   # ¥ typical single-section fare, 普通車
+
+# Geographic bounding boxes to distinguish urban toll networks from NEXCO
+# (lat_min, lat_max, lon_min, lon_max)
+_SHUTOKO_BBOX = (35.50, 35.90, 139.40, 139.90)
+_HANSHIN_BBOX = (34.50, 34.90, 135.20, 135.70)
+
+
+def _toll_network(lat: float, lon: float) -> str:
+    """Return which toll network a coordinate belongs to."""
+    if (_SHUTOKO_BBOX[0] <= lat <= _SHUTOKO_BBOX[1] and
+            _SHUTOKO_BBOX[2] <= lon <= _SHUTOKO_BBOX[3]):
+        return "shutoko"
+    if (_HANSHIN_BBOX[0] <= lat <= _HANSHIN_BBOX[1] and
+            _HANSHIN_BBOX[2] <= lon <= _HANSHIN_BBOX[3]):
+        return "hanshin"
+    return "nexco"
+
+
+def _calc_toll(path: dict) -> int | None:
+    """Return estimated toll in yen for a path, or None if no toll data."""
+    details = path.get("details", {})
+    toll_segs  = details.get("toll", [])
+    dist_segs  = details.get("distance", [])
+    rc_segs    = details.get("road_class", [])
+    if not toll_segs or not dist_segs or not rc_segs:
+        return None
+
+    coords = path["points"]["coordinates"]  # [lon, lat]
+
+    # Build per-coord-pair distance lookup
+    pair_dist = {fi: dm for fi, ti, dm in dist_segs}
+
+    # Build per-coord-pair road_class lookup (sparse — use range walk)
+    pair_class: dict[int, str] = {}
+    for fi, ti, cls in rc_segs:
+        for i in range(fi, ti):
+            pair_class[i] = cls
+
+    # Accumulate tolled distance per network
+    nexco_m    = 0.0
+    shutoko_m  = 0.0
+    hanshin_m  = 0.0
+    has_shutoko = False
+    has_hanshin = False
+
+    for fi, ti, toll_val in toll_segs:
+        if toll_val.lower() != "all":
+            continue
+        for i in range(fi, ti):
+            cls = pair_class.get(i, "")
+            if cls not in ("motorway", "trunk"):
+                continue
+            dm = pair_dist.get(i, 0.0)
+            if dm == 0:
+                continue
+            # midpoint coordinate
+            if i < len(coords) - 1:
+                mlon = (coords[i][0] + coords[i+1][0]) * 0.5
+                mlat = (coords[i][1] + coords[i+1][1]) * 0.5
+            else:
+                mlon, mlat = coords[i]
+            network = _toll_network(mlat, mlon)
+            if network == "shutoko":
+                shutoko_m += dm
+                has_shutoko = True
+            elif network == "hanshin":
+                hanshin_m += dm
+                has_hanshin = True
+            else:
+                nexco_m += dm
+
+    total = 0
+
+    if nexco_m > 0:
+        raw = _NEXCO_TERMINAL + (nexco_m / 1000) * _NEXCO_PER_KM
+        total += math.ceil(raw / 10) * 10
+
+    if has_shutoko:
+        raw = (shutoko_m / 1000) * _SHUTOKO_PER_KM
+        total += max(_SHUTOKO_MIN, min(_SHUTOKO_MAX, math.ceil(raw / 10) * 10))
+
+    if has_hanshin:
+        total += _HANSHIN_FLAT
+
+    return total if (nexco_m > 0 or has_shutoko or has_hanshin) else None
+
 app = FastAPI()
 
 # ---------------------------------------------------------------------------
@@ -142,7 +243,7 @@ async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
         "profile": profile,
         "ch.disable": True,
         "points_encoded": False,
-        "details": ["time", "distance"],
+        "details": ["time", "distance", "road_class", "toll"],
     }
     try:
         r = await client.post(f"{GH}/route", content=json.dumps(body).encode(),
@@ -207,7 +308,7 @@ async def route(request: Request):
                         media_type="application/json")
 
     body.setdefault("details", [])
-    for d in ("time", "distance"):
+    for d in ("time", "distance", "road_class", "toll"):
         if d not in body["details"]:
             body["details"].append(d)
     body["points_encoded"] = False
@@ -267,12 +368,15 @@ async def route(request: Request):
                         break
             t.mark(f"charger filter ({added} kept)")
 
-    # GPS scoring across all paths (direct + via-charger)
+    # GPS scoring + toll calculation across all paths
     for path in paths:
         scored = _score_path(path)
         if scored is not None:
             path["scored_time_ms"] = scored
-    t.mark(f"GPS scoring ({len(paths)} paths)")
+        toll = _calc_toll(path)
+        if toll is not None:
+            path["toll_jpy"] = toll
+    t.mark(f"GPS scoring + toll ({len(paths)} paths)")
 
     data["paths"] = paths
     t.report(f"route {profile} {start_ll} → {end_ll}")

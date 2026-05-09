@@ -184,11 +184,12 @@
       const timeStr = path.scored_time_ms != null
         ? `GH ${ghTime} / GPS ${fmtTime(path.scored_time_ms)}`
         : ghTime;
+      const tollStr = path.toll_jpy != null ? ` · ¥${path.toll_jpy.toLocaleString()}` : "";
       if (path.charger) {
         const kw = path.charger.max_output ? ` ${path.charger.max_output}` : "";
-        return `${km} km · ${timeStr} · via ${path.charger.name}${kw}`;
+        return `${km} km · ${timeStr}${tollStr} · via ${path.charger.name}${kw}`;
       }
-      return `${km} km · ${timeStr}`;
+      return `${km} km · ${timeStr}${tollStr}`;
     }
 
     async function resolve(query) {
