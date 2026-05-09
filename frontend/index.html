@@ -98,37 +98,67 @@
       }
 
       loadChargers();
+      loadHotSprings();
     });
 
     const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
+
+    const POI_STYLES = {
+      charger:    { bg: "#00b300", activeBg: "#7b2fbe" },
+      hot_spring: { bg: "#e07000", activeBg: "#7b2fbe" },
+    };
+
+    function makeMarkerEl(bg) {
+      const el = document.createElement("div");
+      el.style.cssText = [
+        "width:14px", "height:14px", "border-radius:50%",
+        `background:${bg}`, "border:2px solid #fff",
+        "box-shadow:0 1px 3px rgba(0,0,0,.4)", "cursor:pointer",
+      ].join(";");
+      return el;
+    }
 
     async function loadChargers() {
       const r = await fetch("flash_chargers.json");
       const chargers = await r.json();
       for (const c of chargers) {
-        const el = document.createElement("div");
-        el.style.cssText = [
-          "width:14px", "height:14px", "border-radius:50%",
-          "background:#00b300", "border:2px solid #fff",
-          "box-shadow:0 1px 3px rgba(0,0,0,.4)", "cursor:pointer",
-        ].join(";");
-
+        const el = makeMarkerEl(POI_STYLES.charger.bg);
         const lines = [
           `<strong>${c.name}</strong>`,
-          c.address  ? c.address : null,
+          c.address    ? c.address : null,
           c.max_output ? `出力: ${c.max_output}` : null,
-          c.hours    ? `営業: ${c.hours}` : null,
-          c.closed   ? `定休: ${c.closed}` : null,
+          c.hours      ? `営業: ${c.hours}` : null,
+          c.closed     ? `定休: ${c.closed}` : null,
           c.connector_types ? c.connector_types.join(" / ") : null,
           c.status === "under_adjustment" ? "<em>調整中</em>" : null,
         ].filter(Boolean).join("<br>");
-
         new maplibregl.Marker({ element: el })
           .setLngLat([c.lon, c.lat])
           .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
           .addTo(map);
         chargerEls.set(`${c.lat},${c.lon}`, el);
       }
+    }
+
+    async function loadHotSprings() {
+      try {
+        const r = await fetch("hot_springs.json");
+        const springs = await r.json();
+        for (const s of springs) {
+          const el = makeMarkerEl(POI_STYLES.hot_spring.bg);
+          const lines = [
+            `<strong>${s.name}</strong>`,
+            s.opening_hours ? `営業: ${s.opening_hours}` : null,
+            s.fee           ? `料金: ${s.fee}` : null,
+            s.website       ? `<a href="${s.website}" target="_blank">website</a>` : null,
+          ].filter(Boolean).join("<br>");
+          new maplibregl.Marker({ element: el })
+            .setLngLat([s.lon, s.lat])
+            .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
+            .addTo(map);
+          chargerEls.set(`${s.lat},${s.lon}`, el);
+        }
+      } catch (e) { console.warn("hot_springs.json not found"); }
     }
 
     function emptyGeoJSON() {
@@ -148,7 +178,10 @@
         map.setPaintProperty(`route-${i}`, "line-opacity", 0);
       }
       if (activeChargerEl) {
-        activeChargerEl.style.background = "#00b300";
+        const prev = routes[primaryIndex]?.via_poi;
+        activeChargerEl.style.background = prev
+          ? (POI_STYLES[prev.type]?.bg ?? "#00b300")
+          : "#00b300";
         activeChargerEl = null;
       }
     }
@@ -157,7 +190,7 @@
       const r = routes[index];
       if (!r) return;
       let color, dimColor;
-      if (r.charger) {
+      if (r.via_poi) {
         color = "#7b2fbe"; dimColor = "#b48fd4";
       } else {
         const s = STRATEGIES[r.strategyIndex];
@@ -179,12 +212,15 @@
       document.getElementById("status").textContent = routes[index].summary;
 
       if (activeChargerEl) {
-        activeChargerEl.style.background = "#00b300";
+        const prev = routes[primaryIndex]?.via_poi;
+        activeChargerEl.style.background = prev
+          ? (POI_STYLES[prev.type]?.bg ?? "#00b300")
+          : "#00b300";
         activeChargerEl = null;
       }
-      const c = routes[index]?.charger;
-      if (c) {
-        const el = chargerEls.get(`${c.lat},${c.lon}`);
+      const poi = routes[index]?.via_poi;
+      if (poi) {
+        const el = chargerEls.get(`${poi.lat},${poi.lon}`);
         if (el) { el.style.background = "#7b2fbe"; activeChargerEl = el; }
       }
     }
@@ -202,9 +238,10 @@
         ? `GH ${ghTime} / GPS ${fmtTime(path.scored_time_ms)}`
         : ghTime;
       const tollStr = path.toll_jpy != null ? ` · ¥${path.toll_jpy.toLocaleString()}` : "";
-      if (path.charger) {
-        const kw = path.charger.max_output ? ` ${path.charger.max_output}` : "";
-        return `${km} km · ${timeStr}${tollStr} · via ${path.charger.name}${kw}`;
+      if (path.via_poi) {
+        const p = path.via_poi;
+        const extra = p.max_output ? ` ${p.max_output}` : "";
+        return `${km} km · ${timeStr}${tollStr} · via ${p.name}${extra}`;
       }
       return `${km} km · ${timeStr}${tollStr}`;
     }
@@ -242,11 +279,11 @@
         return data.paths.map((path, j) => ({
           coords:        path.points.coordinates,
           summary:       summarise(path),
-          label:         path.charger
-                           ? `⚡ ${path.charger.name}`
+          label:         path.via_poi
+                           ? `${path.via_poi.type === "hot_spring" ? "♨" : "⚡"} ${path.via_poi.name}`
                            : (j === 0 ? s.label : `${s.label} ${j + 1}`),
           strategyIndex,
-          charger:       path.charger || null,
+          via_poi:       path.via_poi || null,
         }));
       } catch {
         return [];

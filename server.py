@@ -22,8 +22,9 @@ MIN_SAMPLES =  5   # minimum GPS points needed to trust the estimate
 
 CLUSTER_RADIUS_M    =  3_000  # merge POIs within 3 km into one cluster
 DETOUR_MAX_RATIO    =   1.20  # keep via-POI routes up to 20% longer than direct
+MAX_POI_PERP_M      = 50_000  # max perpendicular distance from direct route line
 MAX_CHARGER_ROUTES  =      5  # cap on charger routes returned per request
-MAX_CHARGER_GH_REQS =     15  # cap on GH requests fired per query
+MAX_CHARGER_GH_REQS =     10  # cap on GH requests fired per query
 
 # ---------------------------------------------------------------------------
 # Toll calculation constants
@@ -179,13 +180,19 @@ def _build_clusters(pois: list) -> list:
             clusters.append({"lat": poi["lat"], "lon": poi["lon"], "members": [poi]})
     return clusters
 
-_CHARGER_FILE = "frontend/flash_chargers.json"
-_chargers: list = []
-if os.path.exists(_CHARGER_FILE):
-    with open(_CHARGER_FILE, encoding="utf-8") as _f:
-        _chargers = json.load(_f)
-_clusters: list = _build_clusters(_chargers)
-log.info(f"Loaded {len(_chargers)} chargers → {len(_clusters)} clusters")
+def _load_poi_layer(poi_type: str, filepath: str) -> dict:
+    pois = []
+    if os.path.exists(filepath):
+        with open(filepath, encoding="utf-8") as f:
+            pois = json.load(f)
+    clusters = _build_clusters(pois)
+    log.info(f"Loaded {len(pois)} {poi_type} → {len(clusters)} clusters")
+    return {"type": poi_type, "pois": pois, "clusters": clusters}
+
+_poi_layers: list = [
+    _load_poi_layer("charger",    "frontend/flash_chargers.json"),
+    _load_poi_layer("hot_spring", "frontend/hot_springs.json"),
+]
 
 # ---------------------------------------------------------------------------
 # GPS tile loading
@@ -251,8 +258,8 @@ def _score_path(path: dict) -> int | None:
 # ---------------------------------------------------------------------------
 
 async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
-                              cluster: dict, end_ll: list, profile: str) -> dict | None:
-    # Route via the cluster member with the smallest straight-line detour
+                              poi_type: str, cluster: dict,
+                              end_ll: list, profile: str) -> dict | None:
     s_lat, s_lon = start_ll[1], start_ll[0]
     e_lat, e_lon = end_ll[1], end_ll[0]
     best = min(cluster["members"],
@@ -274,12 +281,17 @@ async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
         if not paths:
             return None
         path = paths[0]
-        path["charger"] = {
-            "name":       best["name"],
+        path["via_poi"] = {
+            "type":    poi_type,
+            "name":    best["name"],
+            "lat":     best["lat"],
+            "lon":     best["lon"],
+            # charger-specific fields (empty for other types)
             "max_output": best.get("max_output", ""),
             "address":    best.get("address", ""),
-            "lat":        best["lat"],
-            "lon":        best["lon"],
+            # hot-spring-specific fields
+            "opening_hours": best.get("opening_hours", ""),
+            "fee":           best.get("fee", ""),
         }
         return path
     except Exception:
@@ -353,7 +365,7 @@ async def route(request: Request):
             return Response(content=r.content, status_code=200,
                             media_type="application/json")
 
-        # Via-charger routes (expressway profile only, single start/end only)
+        # Via-POI routes (expressway profile only, single start/end only)
         if profile == "car_motorway" and len(body["points"]) == 2:
             direct_dist = paths[0]["distance"]
             s_lat, s_lon = start_ll[1], start_ll[0]
@@ -362,23 +374,31 @@ async def route(request: Request):
             d_max    = d_direct * DETOUR_MAX_RATIO
 
             ranked = []
-            for c in _clusters:
-                da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
-                db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
-                if da + db <= d_max:
-                    ranked.append((da + db - d_direct, c))
+            for layer in _poi_layers:
+                for c in layer["clusters"]:
+                    da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
+                    db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
+                    if da + db > d_max:
+                        continue
+                    if d_direct > 0:
+                        cos_a = (da**2 + d_direct**2 - db**2) / (2 * da * d_direct)
+                        perp = da * math.sqrt(max(0.0, 1 - max(-1.0, min(1.0, cos_a))**2))
+                        if perp > MAX_POI_PERP_M:
+                            continue
+                    ranked.append((da + db - d_direct, layer["type"], c))
             ranked.sort()
-            nearby_clusters = [c for _, c in ranked][:MAX_CHARGER_GH_REQS]
-            t.mark(f"charger ellipse filter ({len(nearby_clusters)} clusters from {len(_clusters)})")
+            nearby = ranked[:MAX_CHARGER_GH_REQS]
+            total_clusters = sum(len(l["clusters"]) for l in _poi_layers)
+            t.mark(f"POI ellipse filter ({len(ranked)} → {len(nearby)} from {total_clusters} clusters)")
 
-            charger_paths = await asyncio.gather(
-                *[_route_via_cluster(client, start_ll, c, end_ll, profile)
-                  for c in nearby_clusters]
+            poi_paths = await asyncio.gather(
+                *[_route_via_cluster(client, start_ll, poi_type, c, end_ll, profile)
+                  for _, poi_type, c in nearby]
             )
-            t.mark(f"GH charger routes ({len(nearby_clusters)} requests)")
+            t.mark(f"GH POI routes ({len(nearby)} requests)")
 
             added = 0
-            for cp in charger_paths:
+            for cp in poi_paths:
                 if cp is None:
                     continue
                 if cp["distance"] <= direct_dist * DETOUR_MAX_RATIO:
@@ -386,7 +406,7 @@ async def route(request: Request):
                     added += 1
                     if added >= MAX_CHARGER_ROUTES:
                         break
-            t.mark(f"charger filter ({added} kept)")
+            t.mark(f"POI filter ({added} kept)")
 
     # GPS scoring + toll calculation across all paths
     for path in paths:
