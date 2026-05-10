@@ -6,7 +6,7 @@
 Browser → nginx → frontend (port 2026)   static HTML/JS map UI
                → API server (port 2029)  Python/FastAPI scoring layer
                      ↓
-               GraphHopper (port 2027)   routing engine (OSM data)
+               Valhalla (port 8002)      routing engine (OSM data)
                      +
                planet_gps/tiles/         pre-built GPS speed estimates
 ```
@@ -15,31 +15,34 @@ Three processes must be running. Start them in separate terminals (or tmux panes
 
 ---
 
-## 1. GraphHopper (routing engine)
+## 1. Valhalla (routing engine)
 
 ```bash
-cd ~/working/denbura
-java -jar graphhopper/graphhopper-web-11.0.jar server graphhopper/config.yml
+LD_LIBRARY_PATH=$HOME/.local/lib \
+  ~/.local/bin/valhalla_service \
+  ~/working/denbura/valhalla/config.json 4
 ```
 
-Listens on **port 2027**. Reads the Japan OSM map (`data/osm/japan-latest.osm.pbf`)
-and custom routing profiles from `graphhopper/*.json`.
+Listens on **port 8002**. Reads pre-built tiles from `valhalla/tiles/` (3.3 GB).
+The `4` argument is the number of worker processes — increase for heavier load.
 
-**Graph cache** (`data/graph-cache/`): built on the first run after the OSM file, any
-profile change, or any change to `graph.encoded_values` in `config.yml` (~30–60 min
-for Japan); subsequent starts load the cache in seconds. Delete the cache directory
-to force a rebuild.
+**Tile build** (one-off, ~13 min for Japan on 16 cores):
+```bash
+LD_LIBRARY_PATH=$HOME/.local/lib \
+  ~/.local/bin/valhalla_build_tiles \
+  -c ~/working/denbura/valhalla/config.json \
+  ~/working/denbura/data/osm/japan-latest.osm.pbf
+```
 
-**Encoded values** (defined in `graphhopper/config.yml`): the graph currently encodes
-`car_access`, `car_average_speed`, `road_access`, `road_class`, and `toll`. Adding or
-removing an encoded value requires deleting `data/graph-cache/` and rebuilding.
+Rebuild after updating the OSM file. Config is at `valhalla/config.json`.
 
-**Profiles** (defined in `graphhopper/config.yml`):
-- `car_motorway` — prefers expressways
-- `car_local` — avoids expressways, prefers local roads
-- `car_extreme` — strongly avoids expressways
+**Binaries** are installed to `~/.local/bin/`. Built from source at
+`~/working/valhalla/` (tag 3.6.0). Requires `LD_LIBRARY_PATH=$HOME/.local/lib`
+because prime_server and Valhalla itself are installed to `~/.local/lib`.
 
-Custom model JSON files in `graphhopper/` tune speed and priority per road class.
+**Profiles** are mapped in `server.py`:
+- `car_motorway` → `auto` costing with `use_highways: 1.0, use_tolls: 1.0`
+- `car_local`    → `auto` costing with `use_highways: 0.0, use_tolls: 0.0`
 
 ---
 
@@ -51,28 +54,26 @@ source ~/venvs/denbura/bin/activate
 uvicorn server:app --host 127.0.0.1 --port 2029
 ```
 
-Listens on **port 2029**. Sits between the frontend and GraphHopper:
+Listens on **port 2029**. Sits between the frontend and Valhalla:
 
-- Forwards route requests to GraphHopper, requesting `details: [time, distance,
-  road_class, toll]` to get per-segment data back.
-- Loads GPS speed tiles from `planet_gps/tiles/` (1°×1° `.npz` files) on demand,
-  builds a scipy `cKDTree` per tile, and caches both in memory for the lifetime of
-  the process. For each route segment, finds GPS trace speed samples within 50 m and
-  computes a median speed. If ≥5 samples exist, uses that to compute `scored_time_ms`;
-  otherwise falls back to GraphHopper's estimate.
-- Calculates expressway toll cost (`toll_jpy`) from per-segment `toll` and `road_class`
-  details. Applies NEXCO rates (¥24.6/km + ¥150 terminal charge, 普通車) for most
-  expressways; uses a distance-capped formula for the Shutoko (Tokyo metropolitan
-  expressway, min ¥310 / max ¥1,320) and a flat approximation for Hanshin (Osaka).
-  Urban networks are identified by geographic bounding box from the route coordinates.
-- For `car_motorway` routes, adds via-charger alternatives using Flash EV charger data.
-  Clusters chargers at startup, filters candidates with an ellipse pre-filter
-  (A→charger→B ≤ 120% of direct distance), and caps GH requests at 15 per query.
-- Returns the original GraphHopper response augmented with `scored_time_ms` and
-  `toll_jpy` on each path.
-
-Tiles and KDTrees are built on first request per 1°×1° region; subsequent requests
-for the same area are served from the in-process cache.
+- Forwards route requests to Valhalla (`alternates: 3` for up to 4 routes per profile).
+- Loads GPS speed tiles from `planet_gps/tiles/` (1°×1° `.npz` files) at startup,
+  builds a scipy `cKDTree` per tile, and caches both in memory. For each route
+  maneuver, finds GPS trace speed samples within 50 m and computes a median speed.
+  If ≥5 samples exist, uses GPS speed to compute `scored_time_ms`; otherwise falls
+  back to Valhalla's estimate.
+- Calculates expressway toll cost (`toll_jpy`) from Valhalla maneuvers flagged
+  `toll: true`. Applies NEXCO rates (¥24.6/km + ¥150 terminal charge per entry,
+  普通車) with long-distance discounts (25% off 100–200 km, 30% off 200 km+).
+  Uses a distance-capped formula for the Shutoko (Tokyo metro expressway,
+  min ¥310 / max ¥1,320) and a flat approximation for Hanshin (Osaka).
+  Urban networks are identified by geographic bounding box.
+- For `car_motorway` routes, adds via-POI alternatives (chargers, hot springs).
+  Clusters POIs at startup, filters candidates with an ellipse pre-filter
+  (A→POI→B ≤ 120% of direct distance) plus a 50 km perpendicular-distance cap,
+  and caps Valhalla requests at 10 per query.
+- Returns a `{"paths": [...]}` response with `scored_time_ms`, `toll_jpy`, and
+  `via_poi` added to each path.
 
 ---
 
@@ -88,10 +89,10 @@ Listens on **port 2026**. Serves `frontend/index.html` — a MapLibre GL map wit
 - Geocoding via Nominatim (OSM)
 - Two routing profiles shown simultaneously: expressway (blue) and local (orange)
 - Up to 12 alternative routes displayed at once, clickable to promote
-- Route buttons show GraphHopper time, GPS-estimated time, and expressway toll:
+- Route buttons show Valhalla time, GPS-estimated time, and expressway toll:
   `454.0 km · GH 5h53m / GPS 4h50m · ¥8,890`
-- Via-charger routes shown in purple with charger name and output in the label
-- Flash EV charger locations shown as green markers with popup details
+- Via-POI routes shown in purple with POI name in the label (⚡ chargers, ♨ hot springs)
+- Flash EV charger locations shown as green markers; hot springs as orange markers
 
 ---
 
@@ -169,5 +170,5 @@ Update with:
 
 ```bash
 wget -O data/osm/japan-latest.osm.pbf https://download.geofabrik.de/asia/japan-latest.osm.pbf
-rm -rf data/graph-cache/   # force GraphHopper to rebuild
+# then rebuild Valhalla tiles (see above)
 ```
