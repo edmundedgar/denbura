@@ -38,14 +38,19 @@
     <input id="from" value="益子" placeholder="from — place name or lat,lon" onfocus="focusedInput='from'">
     <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon"  onfocus="focusedInput='to'">
     <button onclick="getRoute()">Route</button>
+    <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center">
+      Start <input id="start-charge" type="number" min="0" max="100" value="80"
+                   style="width:46px;padding:4px 4px;border:1px solid #ccc;border-radius:4px;font-size:13px;text-align:right"> %
+    </label>
     <span id="status"></span>
   </div>
   <div id="route-list"></div>
   <div id="map"></div>
 
   <script>
-    const GH        = "api";
-    const NOMINATIM = "https://nominatim.openstreetmap.org/search";
+    const GH            = "api";
+    const NOMINATIM     = "https://nominatim.openstreetmap.org/search";
+    const EV_BATTERY_KWH = 82.5;
 
     const STRATEGIES = [
       { profile: "car_motorway", label: "Exp",   color: "#0078d4", dimColor: "#90bfe8" },
@@ -99,6 +104,33 @@
 
       loadChargers();
       loadHotSprings();
+
+      const chargeTip = new maplibregl.Popup({
+        closeButton: false, closeOnClick: false, anchor: "bottom",
+      });
+
+      map.on("mousemove", (e) => {
+        const layerIds = Array.from({length: MAX_ROUTES}, (_, i) => `route-${i}`);
+        const hit = map.queryRenderedFeatures(e.point, { layers: layerIds });
+        if (!hit.length) { chargeTip.remove(); return; }
+        const idx = parseInt(hit[0].layer.id.split("-")[1]);
+        const r = routes[idx];
+        if (!r?.consumed_kwh?.length) return;
+        const { lng, lat } = e.lngLat;
+        let minD = Infinity, ptIdx = 0;
+        for (let i = 0; i < r.coords.length; i++) {
+          const dx = r.coords[i][0] - lng, dy = r.coords[i][1] - lat;
+          const d = dx * dx + dy * dy;
+          if (d < minD) { minD = d; ptIdx = i; }
+        }
+        const start = parseFloat(document.getElementById("start-charge").value) || 80;
+        const pct = Math.max(0, start - r.consumed_kwh[ptIdx] / EV_BATTERY_KWH * 100);
+        chargeTip.setLngLat(e.lngLat)
+          .setHTML(`<b>${pct.toFixed(1)}%</b> charge`)
+          .addTo(map);
+      });
+
+      map.getCanvas().addEventListener("mouseleave", () => chargeTip.remove());
     });
 
     const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
@@ -238,12 +270,18 @@
         ? `GH ${ghTime} / GPS ${fmtTime(path.scored_time_ms)}`
         : ghTime;
       const tollStr = path.toll_jpy != null ? ` · ¥${path.toll_jpy.toLocaleString()}` : "";
+      let chargeStr = "";
+      if (path.consumed_kwh?.length) {
+        const start = parseFloat(document.getElementById("start-charge").value) || 80;
+        const dest  = Math.max(0, start - path.consumed_kwh.at(-1) / EV_BATTERY_KWH * 100);
+        chargeStr = ` · →${dest.toFixed(0)}%`;
+      }
       if (path.via_poi) {
         const p = path.via_poi;
         const extra = p.max_output ? ` ${p.max_output}` : "";
-        return `${km} km · ${timeStr}${tollStr} · via ${p.name}${extra}`;
+        return `${km} km · ${timeStr}${tollStr}${chargeStr} · via ${p.name}${extra}`;
       }
-      return `${km} km · ${timeStr}${tollStr}`;
+      return `${km} km · ${timeStr}${tollStr}${chargeStr}`;
     }
 
     async function resolve(query) {
@@ -284,6 +322,7 @@
                            : (j === 0 ? s.label : `${s.label} ${j + 1}`),
           strategyIndex,
           via_poi:       path.via_poi || null,
+          consumed_kwh:  path.consumed_kwh || null,
         }));
       } catch {
         return [];

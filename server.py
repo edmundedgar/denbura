@@ -53,6 +53,20 @@ _HANSHIN_FLAT   =  630
 _SHUTOKO_BBOX = (35.50, 35.90, 139.40, 139.90)
 _HANSHIN_BBOX = (34.50, 34.90, 135.20, 135.70)
 
+# ---------------------------------------------------------------------------
+# EV physics model — BYD Seal AWD (Japan WLTC: 82.5 kWh, 575 km, 14.4 kWh/100km)
+# ---------------------------------------------------------------------------
+
+_EV_MASS_KG    = 2200.0
+_EV_CD         = 0.219
+_EV_FRONTAL_M2 = 2.73
+_EV_CRR        = 0.009
+_EV_ETA_DRIVE  = 0.90   # drivetrain efficiency (motor → wheels)
+_EV_ETA_REGEN  = 0.65   # regenerative braking efficiency (wheels → battery)
+_EV_BATTERY_KWH = 82.5
+_AIR_DENSITY   = 1.225  # kg/m³ at sea level, 15 °C
+_GRAVITY       = 9.81   # m/s²
+
 
 def _toll_network(lat: float, lon: float) -> str:
     if (_SHUTOKO_BBOX[0] <= lat <= _SHUTOKO_BBOX[1] and
@@ -202,6 +216,53 @@ def _calc_toll_leg(leg: dict, coords: list) -> int | None:
     return total if (nexco_m > 0 or shutoko_seen or hanshin_seen) else None
 
 # ---------------------------------------------------------------------------
+# EV energy helpers
+# ---------------------------------------------------------------------------
+
+def _energy_joules(dist_m: float, speed_ms: float, dh_m: float) -> float:
+    F_roll = _EV_CRR * _EV_MASS_KG * _GRAVITY
+    F_aero = 0.5 * _AIR_DENSITY * _EV_CD * _EV_FRONTAL_M2 * speed_ms ** 2
+    E_level = (F_roll + F_aero) * dist_m / _EV_ETA_DRIVE
+    E_grav  = (_EV_MASS_KG * _GRAVITY * dh_m / _EV_ETA_DRIVE if dh_m >= 0
+               else _EV_MASS_KG * _GRAVITY * dh_m * _EV_ETA_REGEN)
+    return E_level + E_grav
+
+
+def _leg_consumed_kwh(leg: dict, coords_ll: list) -> list:
+    """Cumulative kWh consumed per shape point (no elevation — DEM not yet configured)."""
+    n = len(coords_ll)
+    if n == 0:
+        return []
+    seg_speed_ms = [0.0] * max(n - 1, 0)
+    for m in leg.get("maneuvers", []):
+        si, ei   = m["begin_shape_index"], m["end_shape_index"]
+        dist_m   = m["length"] * 1000
+        time_s   = m["time"]
+        speed_ms = dist_m / time_s if dist_m > 0 and time_s > 0 else 0.0
+        mid_i = (si + ei) // 2
+        if mid_i < n:
+            mlat, mlon = coords_ll[mid_i]
+            tile = _load_tile(int(math.floor(mlat)), int(math.floor(mlon)))
+            if tile is not None:
+                _, _, speeds, tree, lat_m, lon_m = tile
+                idx = tree.query_ball_point([mlat * lat_m, mlon * lon_m], r=RADIUS_M)
+                if len(idx) >= MIN_SAMPLES:
+                    speed_ms = float(np.median(speeds[idx])) / 3.6
+        for j in range(si, min(ei, n - 1)):
+            seg_speed_ms[j] = speed_ms
+
+    result = [0.0]
+    for j in range(n - 1):
+        lat1, lon1 = coords_ll[j]
+        lat2, lon2 = coords_ll[j + 1]
+        # _haversine_m is defined in the FastAPI section below; Python resolves at call time
+        seg_m = _haversine_m(lat1, lon1, lat2, lon2)
+        s = seg_speed_ms[j]
+        kwh = _energy_joules(seg_m, s, 0.0) / 3_600_000 if s > 0 else 0.0
+        result.append(result[-1] + kwh)
+    return result
+
+# ---------------------------------------------------------------------------
 # Convert a Valhalla trip → our path dict (GH-compatible format for frontend)
 # ---------------------------------------------------------------------------
 
@@ -212,10 +273,11 @@ def _trip_to_path(trip: dict, via_poi: dict | None = None) -> dict:
     lonlat = [[c[1], c[0]] for c in coords]          # GeoJSON [lon, lat]
 
     path = {
-        "points":   {"type": "LineString", "coordinates": lonlat},
-        "distance": trip["summary"]["length"] * 1000,  # km → m
-        "time":     round(trip["summary"]["time"] * 1000),
+        "points":         {"type": "LineString", "coordinates": lonlat},
+        "distance":       trip["summary"]["length"] * 1000,
+        "time":           round(trip["summary"]["time"] * 1000),
         "scored_time_ms": _score_leg(leg, coords),
+        "consumed_kwh":   [round(v, 3) for v in _leg_consumed_kwh(leg, coords)],
     }
     toll = _calc_toll_leg(leg, coords)
     if toll is not None:
@@ -306,15 +368,20 @@ async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
             return None
 
         # Combine both legs (A→POI and POI→B) into one path
-        all_lonlat: list = []
+        all_lonlat: list      = []
+        all_consumed_kwh: list = []
         total_time_ms = total_dist_m = total_scored_ms = total_toll = 0
 
         for i, leg in enumerate(trip["legs"]):
             coords = _decode_polyline(leg["shape"])
             lonlat = [[c[1], c[0]] for c in coords]
+            kwh    = _leg_consumed_kwh(leg, coords)
             if i > 0:
                 lonlat = lonlat[1:]   # skip duplicate junction point
+                offset = all_consumed_kwh[-1] if all_consumed_kwh else 0.0
+                kwh = [offset + v for v in kwh[1:]]
             all_lonlat.extend(lonlat)
+            all_consumed_kwh.extend(kwh)
             total_time_ms    += round(leg["summary"]["time"]   * 1000)
             total_dist_m     += leg["summary"]["length"] * 1000
             total_scored_ms  += _score_leg(leg, coords)
@@ -338,6 +405,7 @@ async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
             "time":           total_time_ms,
             "scored_time_ms": total_scored_ms,
             "via_poi":        via_poi,
+            "consumed_kwh":   [round(v, 3) for v in all_consumed_kwh],
         }
         if total_toll:
             path["toll_jpy"] = total_toll
