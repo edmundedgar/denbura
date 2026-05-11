@@ -39,8 +39,11 @@
     <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon"  onfocus="focusedInput='to'">
     <button onclick="getRoute()">Route</button>
     <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center">
-      Start <input id="start-charge" type="number" min="0" max="100" value="80"
+      Start <input id="start-charge" type="number" min="0" max="100" value="100"
                    style="width:46px;padding:4px 4px;border:1px solid #ccc;border-radius:4px;font-size:13px;text-align:right"> %
+    </label>
+    <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center;cursor:pointer">
+      <input type="checkbox" id="show-onsens" onchange="applyOnsenToggle()"> ♨ Onsens
     </label>
     <span id="status"></span>
   </div>
@@ -63,6 +66,7 @@
     let primaryIndex = 0;
     let routes = []; // [{coords, label, summary, strategyIndex}]
     const chargerEls = new Map(); // "lat,lon" → marker element
+    const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
 
     const map = new maplibregl.Map({
@@ -189,8 +193,15 @@
             .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
             .addTo(map);
           chargerEls.set(`${s.lat},${s.lon}`, el);
+          hotSpringEls.push(el);
         }
+        applyOnsenToggle();
       } catch (e) { console.warn("hot_springs.json not found"); }
+    }
+
+    function applyOnsenToggle() {
+      const show = document.getElementById("show-onsens").checked;
+      hotSpringEls.forEach(el => { el.style.display = show ? "" : "none"; });
     }
 
     function emptyGeoJSON() {
@@ -304,6 +315,9 @@
           body: JSON.stringify({
             points: [[from[1], from[0]], [to[1], to[0]]],
             profile: s.profile,
+            start_charge_pct: parseFloat(document.getElementById("start-charge").value) || 80,
+            poi_types: document.getElementById("show-onsens").checked
+              ? ["charger", "hot_spring"] : ["charger"],
             "ch.disable": true,
             algorithm: "alternative_route",
             "alternative_route.max_paths": 5,
@@ -317,9 +331,17 @@
         return data.paths.map((path, j) => ({
           coords:        path.points.coordinates,
           summary:       summarise(path),
-          label:         path.via_poi
-                           ? `${path.via_poi.type === "hot_spring" ? "♨" : "⚡"} ${path.via_poi.name}`
-                           : (j === 0 ? s.label : `${s.label} ${j + 1}`),
+          label:         (() => {
+                           if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
+                           const poi = path.via_poi;
+                           const icon = poi.type === "hot_spring" ? "♨" : "⚡";
+                           let lbl = `${icon} ${poi.name}`;
+                           if (poi.secondary) {
+                             const icon2 = poi.secondary.type === "hot_spring" ? "♨" : "⚡";
+                             lbl += ` + ${icon2}`;
+                           }
+                           return lbl;
+                         })(),
           strategyIndex,
           via_poi:       path.via_poi || null,
           consumed_kwh:  path.consumed_kwh || null,

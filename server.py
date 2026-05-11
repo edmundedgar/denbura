@@ -23,8 +23,19 @@ MIN_SAMPLES =  5
 CLUSTER_RADIUS_M =  3_000
 DETOUR_MAX_RATIO =   1.20
 MAX_POI_PERP_M   = 50_000
-MAX_POI_ROUTES   =      5
-MAX_POI_REQS     =     10
+MAX_POI_ROUTES   =      8
+
+# Charging need thresholds (destination arrival %)
+CHARGE_CRITICAL_PCT     = 20
+CHARGE_PREFERRED_PCT    = 50
+CHARGE_OPTIONAL_MAX_PCT = 85
+
+# Stage 2/3/4 candidate limits
+CHARGER_SEARCH_RADIUS_M =  50_000   # radius around sweet-spot to search for chargers
+NEARBY_ONSEN_RADIUS_M   =   5_000   # onsens within 5 km of a charger count as co-located
+MAX_CHARGER_CANDIDATES  =       5
+MAX_NEARBY_ONSENS       =       2
+MAX_CORRIDOR_ONSENS     =       5
 
 # Map our profile names to Valhalla auto costing options
 _PROFILE_OPTS = {
@@ -337,23 +348,95 @@ _poi_layers: list = [
 ]
 
 # ---------------------------------------------------------------------------
+# Charge-need classification and candidate search
+# ---------------------------------------------------------------------------
+
+def _classify_charge_need(path: dict, start_pct: float) -> str:
+    kwh = path.get("consumed_kwh", [])
+    if not kwh:
+        return "none"
+    dest_pct = start_pct - kwh[-1] / _EV_BATTERY_KWH * 100
+    if dest_pct > CHARGE_OPTIONAL_MAX_PCT:
+        return "none"
+    if dest_pct > CHARGE_PREFERRED_PCT:
+        return "optional"
+    if dest_pct > CHARGE_CRITICAL_PCT:
+        return "recommended"
+    return "critical"
+
+
+def _find_charge_point(path: dict, start_pct: float, target_pct: float) -> tuple:
+    """(lat, lon) of the first shape point where charge drops to target_pct."""
+    coords = path["points"]["coordinates"]   # [[lon, lat], ...]
+    for (lon, lat), kwh in zip(coords, path.get("consumed_kwh", [])):
+        if start_pct - kwh / _EV_BATTERY_KWH * 100 <= target_pct:
+            return lat, lon
+    lon, lat = coords[-1]
+    return lat, lon
+
+
+def _find_nearby_clusters(poi_type: str, center_lat: float, center_lon: float,
+                           radius_m: float, max_n: int = 10) -> list:
+    """Clusters of poi_type within radius_m of center, sorted by distance."""
+    results = []
+    for layer in _poi_layers:
+        if layer["type"] != poi_type:
+            continue
+        for c in layer["clusters"]:
+            d = _haversine_m(center_lat, center_lon, c["lat"], c["lon"])
+            if d <= radius_m:
+                results.append((d, c))
+    results.sort()
+    return [c for _, c in results[:max_n]]
+
+
+def _corridor_clusters(poi_type: str, s_lat: float, s_lon: float,
+                        e_lat: float, e_lon: float, max_n: int = 5) -> list:
+    """Clusters within the A→B ellipse+perpendicular corridor."""
+    d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
+    d_max = d_direct * DETOUR_MAX_RATIO
+    results = []
+    for layer in _poi_layers:
+        if layer["type"] != poi_type:
+            continue
+        for c in layer["clusters"]:
+            da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
+            db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
+            if da + db > d_max:
+                continue
+            if d_direct > 0 and da > 0:
+                cos_a = (da**2 + d_direct**2 - db**2) / (2 * da * d_direct)
+                perp  = da * math.sqrt(max(0.0, 1 - max(-1.0, min(1.0, cos_a))**2))
+                if perp > MAX_POI_PERP_M:
+                    continue
+            results.append((da + db - d_direct, c))
+    results.sort()
+    return [c for _, c in results[:max_n]]
+
+# ---------------------------------------------------------------------------
 # Via-POI routing
 # ---------------------------------------------------------------------------
 
-async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
-                              poi_type: str, cluster: dict,
-                              end_ll: list, costing_opts: dict) -> dict | None:
+async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
+                               stops: list, end_ll: list,
+                               costing_opts: dict,
+                               start_charge_pct: float = 100.0) -> dict | None:
+    """Route A → stop1 → [stop2 →] B.
+
+    stops: [{"type": str, "lat": float, "lon": float, "data": dict}, ...]
+    Charging offset is applied at charger stops (charges to 95 %).
+    Returns None if a charger stop would be reached with ≥ 85 % (no need to charge).
+    """
     s_lat, s_lon = start_ll[1], start_ll[0]
-    e_lat, e_lon = end_ll[1], end_ll[0]
-    best = min(cluster["members"],
-               key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
-                           + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+    e_lat, e_lon = end_ll[1],   end_ll[0]
+
+    locations = [{"lat": s_lat, "lon": s_lon}]
+    for s in stops:
+        locations.append({"lat": s["lat"], "lon": s["lon"]})
+    locations.append({"lat": e_lat, "lon": e_lon})
+
     body = {
-        "locations": [
-            {"lat": s_lat,      "lon": s_lon},
-            {"lat": best["lat"], "lon": best["lon"]},
-            {"lat": e_lat,      "lon": e_lon},
-        ],
+        "locations": locations,
         "costing": "auto",
         "costing_options": {"auto": costing_opts},
     }
@@ -367,38 +450,64 @@ async def _route_via_cluster(client: httpx.AsyncClient, start_ll: list,
         if not trip:
             return None
 
-        # Combine both legs (A→POI and POI→B) into one path
-        all_lonlat: list      = []
+        all_lonlat: list       = []
         all_consumed_kwh: list = []
         total_time_ms = total_dist_m = total_scored_ms = total_toll = 0
+        next_leg_offset = 0.0
 
         for i, leg in enumerate(trip["legs"]):
             coords = _decode_polyline(leg["shape"])
             lonlat = [[c[1], c[0]] for c in coords]
             kwh    = _leg_consumed_kwh(leg, coords)
-            if i > 0:
-                lonlat = lonlat[1:]   # skip duplicate junction point
-                offset = all_consumed_kwh[-1] if all_consumed_kwh else 0.0
-                kwh = [offset + v for v in kwh[1:]]
-            all_lonlat.extend(lonlat)
-            all_consumed_kwh.extend(kwh)
-            total_time_ms    += round(leg["summary"]["time"]   * 1000)
-            total_dist_m     += leg["summary"]["length"] * 1000
-            total_scored_ms  += _score_leg(leg, coords)
+
+            if i == 0:
+                all_lonlat.extend(lonlat)
+                all_consumed_kwh.extend(kwh)
+            else:
+                all_lonlat.extend(lonlat[1:])
+                all_consumed_kwh.extend(next_leg_offset + v for v in kwh[1:])
+
+            # Determine offset for the next leg based on the stop at end of this leg
+            if i < len(stops):
+                stop = stops[i]
+                if stop["type"] == "charger":
+                    arrival_pct = start_charge_pct - all_consumed_kwh[-1] / _EV_BATTERY_KWH * 100
+                    if arrival_pct >= CHARGE_OPTIONAL_MAX_PCT:
+                        return None   # already full; skip this stop
+                    next_leg_offset = (start_charge_pct - 95.0) * _EV_BATTERY_KWH / 100.0
+                else:
+                    next_leg_offset = all_consumed_kwh[-1]
+
+            total_time_ms   += round(leg["summary"]["time"]   * 1000)
+            total_dist_m    += leg["summary"]["length"] * 1000
+            total_scored_ms += _score_leg(leg, coords)
             toll = _calc_toll_leg(leg, coords)
             if toll:
                 total_toll += toll
 
-        via_poi = {
-            "type":          poi_type,
-            "name":          best["name"],
-            "lat":           best["lat"],
-            "lon":           best["lon"],
-            "max_output":    best.get("max_output", ""),
-            "address":       best.get("address", ""),
-            "opening_hours": best.get("opening_hours", ""),
-            "fee":           best.get("fee", ""),
+        # Primary stop is the charger (if any), otherwise the first stop
+        primary = next((s for s in stops if s["type"] == "charger"), stops[0])
+        d = primary["data"]
+        via_poi: dict = {
+            "type":          primary["type"],
+            "name":          d["name"],
+            "lat":           primary["lat"],
+            "lon":           primary["lon"],
+            "max_output":    d.get("max_output", ""),
+            "address":       d.get("address", ""),
+            "opening_hours": d.get("opening_hours", ""),
+            "fee":           d.get("fee", ""),
         }
+        others = [s for s in stops if s is not primary]
+        if others:
+            sec = others[0]
+            via_poi["secondary"] = {
+                "type": sec["type"],
+                "name": sec["data"]["name"],
+                "lat":  sec["lat"],
+                "lon":  sec["lon"],
+            }
+
         path = {
             "points":         {"type": "LineString", "coordinates": all_lonlat},
             "distance":       total_dist_m,
@@ -445,7 +554,9 @@ async def route(request: Request):
     t = _T()
     body = json.loads(await request.body())
 
-    profile    = body.get("profile", "car_motorway")
+    profile          = body.get("profile", "car_motorway")
+    start_charge_pct = float(body.get("start_charge_pct", 80))
+    poi_types        = set(body.get("poi_types", [l["type"] for l in _poi_layers]))
     start_ll   = body["points"][0]   # [lon, lat]
     end_ll     = body["points"][-1]  # [lon, lat]
     s_lat, s_lon = start_ll[1], start_ll[0]
@@ -484,38 +595,67 @@ async def route(request: Request):
         paths = [_trip_to_path(trip) for trip in all_trips]
         t.mark(f"GPS scoring + toll ({len(paths)} paths)")
 
-        # Via-POI routes (motorway profile, single A→B only)
+        # Via-POI routes — staged pipeline (motorway profile, single A→B only)
         if profile == "car_motorway" and len(body["points"]) == 2:
-            direct_dist = paths[0]["distance"]
-            d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
-            d_max    = d_direct * DETOUR_MAX_RATIO
+            direct_dist  = paths[0]["distance"]
+            charge_need  = _classify_charge_need(paths[0], start_charge_pct)
 
-            ranked = []
-            for layer in _poi_layers:
-                for c in layer["clusters"]:
-                    da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
-                    db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
-                    if da + db > d_max:
-                        continue
-                    if d_direct > 0:
-                        cos_a = (da**2 + d_direct**2 - db**2) / (2 * da * d_direct)
-                        perp  = da * math.sqrt(max(0.0, 1 - max(-1.0, min(1.0, cos_a))**2))
-                        if perp > MAX_POI_PERP_M:
-                            continue
-                    ranked.append((da + db - d_direct, layer["type"], c))
-            ranked.sort()
-            nearby = ranked[:MAX_POI_REQS]
-            total_clusters = sum(len(l["clusters"]) for l in _poi_layers)
-            t.mark(f"POI ellipse filter ({len(ranked)} → {len(nearby)} from {total_clusters} clusters)")
+            via_tasks: list = []   # each entry: list of stop dicts
 
-            poi_paths = await asyncio.gather(
-                *[_route_via_cluster(client, start_ll, poi_type, c, end_ll, costing_opts)
-                  for _, poi_type, c in nearby]
+            # Stage 2: charger candidates near the battery sweet-spot
+            if charge_need != "none" and "charger" in poi_types:
+                sw_lat, sw_lon = _find_charge_point(
+                    paths[0], start_charge_pct, CHARGE_PREFERRED_PCT)
+                charger_clusters = _find_nearby_clusters(
+                    "charger", sw_lat, sw_lon,
+                    CHARGER_SEARCH_RADIUS_M, max_n=MAX_CHARGER_CANDIDATES)
+
+                for cc in charger_clusters:
+                    best_c = min(cc["members"],
+                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                    c_stop = {"type": "charger",
+                              "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
+                    via_tasks.append([c_stop])
+
+                    # Stage 3: onsens co-located with this charger
+                    if "hot_spring" in poi_types:
+                        for oc in _find_nearby_clusters(
+                                "hot_spring", best_c["lat"], best_c["lon"],
+                                NEARBY_ONSEN_RADIUS_M, max_n=MAX_NEARBY_ONSENS):
+                            best_o = min(oc["members"],
+                                         key=lambda m: _haversine_m(
+                                             best_c["lat"], best_c["lon"],
+                                             m["lat"], m["lon"]))
+                            o_stop = {"type": "hot_spring",
+                                      "lat": best_o["lat"], "lon": best_o["lon"],
+                                      "data": best_o}
+                            via_tasks.append([c_stop, o_stop])
+
+            # Stage 4: standalone onsens along the route corridor
+            if "hot_spring" in poi_types:
+                for oc in _corridor_clusters("hot_spring", s_lat, s_lon,
+                                              e_lat, e_lon,
+                                              max_n=MAX_CORRIDOR_ONSENS):
+                    best_o = min(oc["members"],
+                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                    o_stop = {"type": "hot_spring",
+                              "lat": best_o["lat"], "lon": best_o["lon"], "data": best_o}
+                    via_tasks.append([o_stop])
+
+            t.mark(f"Stages 2-4: {len(via_tasks)} candidates (charge={charge_need})")
+
+            # Stage 5: route all candidates in parallel
+            poi_results = await asyncio.gather(
+                *[_route_via_waypoints(client, start_ll, stops, end_ll,
+                                       costing_opts, start_charge_pct)
+                  for stops in via_tasks]
             )
-            t.mark(f"Valhalla POI routes ({len(nearby)} requests)")
+            t.mark(f"Stage 5 Valhalla ({len(via_tasks)} requests)")
 
             added = 0
-            for pp in poi_paths:
+            for pp in poi_results:
                 if pp is None:
                     continue
                 if pp["distance"] <= direct_dist * DETOUR_MAX_RATIO:
@@ -523,7 +663,7 @@ async def route(request: Request):
                     added += 1
                     if added >= MAX_POI_ROUTES:
                         break
-            t.mark(f"POI filter ({added} kept)")
+            t.mark(f"filtered to {added} via-POI routes")
 
     t.report(f"route {profile} {start_ll} → {end_ll}")
     return Response(content=json.dumps({"paths": paths}).encode(),
