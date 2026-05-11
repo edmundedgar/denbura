@@ -1,6 +1,6 @@
 {
   "additional_data": {
-    "elevation": "/data/valhalla/elevation/"
+    "elevation": "/home/denbura/working/denbura/data/dem/"
   },
   "httpd": {
     "service": {

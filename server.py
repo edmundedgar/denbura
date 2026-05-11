@@ -8,6 +8,7 @@ import time
 
 import httpx
 import numpy as np
+import tifffile
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from scipy.spatial import cKDTree
@@ -74,6 +75,7 @@ _EV_FRONTAL_M2 = 2.73
 _EV_CRR        = 0.009
 _EV_ETA_DRIVE  = 0.90   # drivetrain efficiency (motor → wheels)
 _EV_ETA_REGEN  = 0.65   # regenerative braking efficiency (wheels → battery)
+_EV_AUX_KW     = 1.5    # constant auxiliary load (HVAC, lighting, electronics)
 _EV_BATTERY_KWH = 82.5
 _AIR_DENSITY   = 1.225  # kg/m³ at sea level, 15 °C
 _GRAVITY       = 9.81   # m/s²
@@ -141,6 +143,45 @@ def _load_tile(tlat: int, tlon: int):
         else:
             _tile_cache[key] = None
     return _tile_cache[key]
+
+# ---------------------------------------------------------------------------
+# DEM elevation cache (SRTM GeoTIFF tiles, 1°×1°)
+# ---------------------------------------------------------------------------
+
+_dem_cache: dict = {}
+_DEM_TILE_DIR  = "data/dem"
+_DEM_STRIDE    = 10   # sample every 10th pixel → ~300 m resolution, ~2 MB/tile
+
+def _load_dem_tile(tile_lat: int, tile_lon: int):
+    key = (tile_lat, tile_lon)
+    if key not in _dem_cache:
+        ns = "N" if tile_lat >= 0 else "S"
+        ew = "E" if tile_lon >= 0 else "W"
+        path = os.path.join(_DEM_TILE_DIR,
+                            f"{ns}{abs(tile_lat):02d}{ew}{abs(tile_lon):03d}.tif")
+        if os.path.exists(path):
+            try:
+                img = tifffile.imread(path)          # float32 (H, W)
+                _dem_cache[key] = img[::_DEM_STRIDE, ::_DEM_STRIDE]
+            except Exception as exc:
+                log.warning(f"DEM load failed {path}: {exc}")
+                _dem_cache[key] = None
+        else:
+            _dem_cache[key] = None
+    return _dem_cache[key]
+
+
+def _get_elevation(lat: float, lon: float) -> float | None:
+    tile_lat = int(math.floor(lat))
+    tile_lon = int(math.floor(lon))
+    tile = _load_dem_tile(tile_lat, tile_lon)
+    if tile is None:
+        return None
+    h, w = tile.shape
+    row = max(0, min(h - 1, int((tile_lat + 1 - lat) * h)))
+    col = max(0, min(w - 1, int((lon - tile_lon) * w)))
+    v = float(tile[row, col])
+    return None if math.isnan(v) else v
 
 # ---------------------------------------------------------------------------
 # GPS scoring — per Valhalla leg
@@ -236,11 +277,12 @@ def _energy_joules(dist_m: float, speed_ms: float, dh_m: float) -> float:
     E_level = (F_roll + F_aero) * dist_m / _EV_ETA_DRIVE
     E_grav  = (_EV_MASS_KG * _GRAVITY * dh_m / _EV_ETA_DRIVE if dh_m >= 0
                else _EV_MASS_KG * _GRAVITY * dh_m * _EV_ETA_REGEN)
-    return E_level + E_grav
+    E_aux   = _EV_AUX_KW * 1000 * dist_m / speed_ms
+    return E_level + E_grav + E_aux
 
 
 def _leg_consumed_kwh(leg: dict, coords_ll: list) -> list:
-    """Cumulative kWh consumed per shape point (no elevation — DEM not yet configured)."""
+    """Cumulative kWh consumed per shape point, using GPS speed and DEM elevation."""
     n = len(coords_ll)
     if n == 0:
         return []
@@ -262,6 +304,21 @@ def _leg_consumed_kwh(leg: dict, coords_ll: list) -> list:
         for j in range(si, min(ei, n - 1)):
             seg_speed_ms[j] = speed_ms
 
+    # Elevation change per segment: sample at maneuver endpoints (not every shape point)
+    # to avoid spikes from stepping across coarse DEM pixel boundaries.
+    seg_dh_m = [0.0] * max(n - 1, 0)
+    for m in leg.get("maneuvers", []):
+        si = m["begin_shape_index"]
+        ei = min(m["end_shape_index"], n - 1)
+        n_segs = max(1, ei - si)
+        if si < n and ei < n:
+            e_start = _get_elevation(*coords_ll[si])
+            e_end   = _get_elevation(*coords_ll[ei])
+            if e_start is not None and e_end is not None:
+                dh_per_seg = (e_end - e_start) / n_segs
+                for j in range(si, min(ei, n - 1)):
+                    seg_dh_m[j] = dh_per_seg
+
     result = [0.0]
     for j in range(n - 1):
         lat1, lon1 = coords_ll[j]
@@ -269,7 +326,10 @@ def _leg_consumed_kwh(leg: dict, coords_ll: list) -> list:
         # _haversine_m is defined in the FastAPI section below; Python resolves at call time
         seg_m = _haversine_m(lat1, lon1, lat2, lon2)
         s = seg_speed_ms[j]
-        kwh = _energy_joules(seg_m, s, 0.0) / 3_600_000 if s > 0 else 0.0
+        if s > 0:
+            kwh = _energy_joules(seg_m, s, seg_dh_m[j]) / 3_600_000
+        else:
+            kwh = 0.0
         result.append(result[-1] + kwh)
     return result
 
@@ -337,6 +397,8 @@ def _load_poi_layer(poi_type: str, filepath: str) -> dict:
     if os.path.exists(filepath):
         with open(filepath, encoding="utf-8") as f:
             pois = json.load(f)
+    if poi_type == "charger":
+        pois = [p for p in pois if not p.get("name", "").startswith("【調整中】")]
     clusters = _build_clusters(pois)
     log.info(f"Loaded {len(pois)} {poi_type} → {len(clusters)} clusters")
     return {"type": poi_type, "pois": pois, "clusters": clusters}
