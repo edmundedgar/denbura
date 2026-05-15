@@ -135,6 +135,8 @@
       });
 
       map.getCanvas().addEventListener("mouseleave", () => chargeTip.remove());
+
+      if (window.location.hash.startsWith("#!")) getRoute({ pushHistory: false });
     });
 
     const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
@@ -203,6 +205,29 @@
       const show = document.getElementById("show-onsens").checked;
       hotSpringEls.forEach(el => { el.style.display = show ? "" : "none"; });
     }
+
+    function loadFromHash() {
+      const hash = window.location.hash;
+      if (!hash.startsWith("#!")) return false;
+      const p = new URLSearchParams(hash.slice(2));
+      const from = p.get("from"), to = p.get("to");
+      if (!from || !to) return false;
+      document.getElementById("from").value = from;
+      document.getElementById("to").value   = to;
+      if (p.has("charge")) document.getElementById("start-charge").value = p.get("charge");
+      if (p.has("onsens")) {
+        document.getElementById("show-onsens").checked = p.get("onsens") === "1";
+        applyOnsenToggle();
+      }
+      return true;
+    }
+
+    // Populate fields immediately (before map finishes loading)
+    loadFromHash();
+
+    window.addEventListener("popstate", () => {
+      if (loadFromHash()) getRoute({ pushHistory: false });
+    });
 
     function emptyGeoJSON() {
       return { type: "FeatureCollection", features: [] };
@@ -373,7 +398,7 @@
       map.fitBounds(bounds, { padding: 60 });
     }
 
-    async function getRoute() {
+    async function getRoute({ pushHistory = true } = {}) {
       const status  = document.getElementById("status");
       const fromVal = document.getElementById("from").value.trim();
       const toVal   = document.getElementById("to").value.trim();
@@ -386,6 +411,15 @@
         status.textContent = e.message;
         return;
       }
+
+      const params = new URLSearchParams({
+        from: fromVal, to: toVal,
+        charge: document.getElementById("start-charge").value,
+        onsens: document.getElementById("show-onsens").checked ? "1" : "0",
+      });
+      const url = "#!" + params.toString();
+      if (pushHistory) history.pushState(null, "", url);
+      else history.replaceState(null, "", url);
 
       clearRoutes();
       routes = [];
