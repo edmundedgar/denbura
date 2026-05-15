@@ -21,3 +21,14 @@ planet_gps/
 # Scraper debug/temp output at project root
 /debug_page.html
 /flash_chargers.json
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Note: data/toll_ics_auto.json and data/toll_ics_overrides.json are tracked
+# (generated but slow to rebuild; small enough to commit)
