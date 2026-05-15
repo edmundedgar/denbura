@@ -10,7 +10,7 @@ import httpx
 import numpy as np
 import tifffile
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from scipy.spatial import cKDTree
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -636,33 +636,32 @@ async def route(request: Request):
         "alternates": 3,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(f"{VALHALLA}/route",
-                              content=json.dumps(valhalla_body).encode(),
-                              headers={"Content-Type": "application/json"})
-        t.mark(f"Valhalla direct ({profile})")
+    async def generate():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{VALHALLA}/route",
+                                  content=json.dumps(valhalla_body).encode(),
+                                  headers={"Content-Type": "application/json"})
+            t.mark(f"Valhalla direct ({profile})")
 
-        if r.status_code != 200:
-            return Response(content=r.content, status_code=r.status_code,
-                            media_type="application/json")
+            if r.status_code != 200 or not r.json().get("trip"):
+                return
 
-        data = r.json()
-        main_trip = data.get("trip")
-        if not main_trip:
-            return Response(content=r.content, status_code=200,
-                            media_type="application/json")
+            data = r.json()
+            all_trips = [data["trip"]] + [a["trip"] for a in data.get("alternates", [])]
+            paths = [_trip_to_path(trip) for trip in all_trips]
+            t.mark(f"GPS scoring + toll ({len(paths)} paths)")
 
-        # Collect all trips: main + alternates
-        all_trips = [main_trip] + [a["trip"] for a in data.get("alternates", [])]
-        paths = [_trip_to_path(trip) for trip in all_trips]
-        t.mark(f"GPS scoring + toll ({len(paths)} paths)")
+            # Yield direct routes immediately so the client can display them
+            yield json.dumps({"paths": paths}) + "\n"
 
-        # Via-POI routes — staged pipeline (motorway profile, single A→B only)
-        if profile == "car_motorway" and len(body["points"]) == 2:
-            direct_dist  = paths[0]["distance"]
-            charge_need  = _classify_charge_need(paths[0], start_charge_pct)
+            # Via-POI routes — staged pipeline (motorway profile, single A→B only)
+            if profile != "car_motorway" or len(body["points"]) != 2:
+                t.report(f"route {profile} {start_ll} → {end_ll}")
+                return
 
-            via_tasks: list = []   # each entry: list of stop dicts
+            direct_dist = paths[0]["distance"]
+            charge_need = _classify_charge_need(paths[0], start_charge_pct)
+            via_tasks: list = []
 
             # Stage 2: charger candidates near the battery sweet-spot
             if charge_need != "none" and "charger" in poi_types:
@@ -716,17 +715,23 @@ async def route(request: Request):
             )
             t.mark(f"Stage 5 Valhalla ({len(via_tasks)} requests)")
 
-            added = 0
+            via_paths = []
             for pp in poi_results:
                 if pp is None:
                     continue
                 if pp["distance"] <= direct_dist * DETOUR_MAX_RATIO:
-                    paths.append(pp)
-                    added += 1
-                    if added >= MAX_POI_ROUTES:
+                    via_paths.append(pp)
+                    if len(via_paths) >= MAX_POI_ROUTES:
                         break
-            t.mark(f"filtered to {added} via-POI routes")
+            t.mark(f"filtered to {len(via_paths)} via-POI routes")
 
-    t.report(f"route {profile} {start_ll} → {end_ll}")
-    return Response(content=json.dumps({"paths": paths}).encode(),
-                    status_code=200, media_type="application/json")
+            if via_paths:
+                yield json.dumps({"paths": via_paths}) + "\n"
+
+        t.report(f"route {profile} {start_ll} → {end_ll}")
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no"},
+    )

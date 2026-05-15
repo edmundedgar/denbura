@@ -306,7 +306,29 @@
       return [parseFloat(results[0].lat), parseFloat(results[0].lon)];
     }
 
-    async function fetchStrategy(from, to, strategyIndex) {
+    function pathsToRoutes(paths, strategyIndex) {
+      const s = STRATEGIES[strategyIndex];
+      return paths.map((path, j) => ({
+        coords:       path.points.coordinates,
+        summary:      summarise(path),
+        label:        (() => {
+                        if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
+                        const poi = path.via_poi;
+                        const icon = poi.type === "hot_spring" ? "♨" : "⚡";
+                        let lbl = `${icon} ${poi.name}`;
+                        if (poi.secondary) {
+                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : "⚡";
+                          lbl += ` + ${icon2}`;
+                        }
+                        return lbl;
+                      })(),
+        strategyIndex,
+        via_poi:      path.via_poi || null,
+        consumed_kwh: path.consumed_kwh || null,
+      }));
+    }
+
+    async function fetchStrategy(from, to, strategyIndex, onBatch) {
       const s = STRATEGIES[strategyIndex];
       try {
         const r = await fetch(`${GH}/route`, {
@@ -318,36 +340,26 @@
             start_charge_pct: parseFloat(document.getElementById("start-charge").value) || 80,
             poi_types: document.getElementById("show-onsens").checked
               ? ["charger", "hot_spring"] : ["charger"],
-            "ch.disable": true,
-            algorithm: "alternative_route",
-            "alternative_route.max_paths": 5,
-            "alternative_route.max_weight_factor": 3.0,
-            "alternative_route.max_share_factor": 0.8,
-            points_encoded: false,
           }),
         });
-        if (!r.ok) return [];
-        const data = await r.json();
-        return data.paths.map((path, j) => ({
-          coords:        path.points.coordinates,
-          summary:       summarise(path),
-          label:         (() => {
-                           if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
-                           const poi = path.via_poi;
-                           const icon = poi.type === "hot_spring" ? "♨" : "⚡";
-                           let lbl = `${icon} ${poi.name}`;
-                           if (poi.secondary) {
-                             const icon2 = poi.secondary.type === "hot_spring" ? "♨" : "⚡";
-                             lbl += ` + ${icon2}`;
-                           }
-                           return lbl;
-                         })(),
-          strategyIndex,
-          via_poi:       path.via_poi || null,
-          consumed_kwh:  path.consumed_kwh || null,
-        }));
-      } catch {
-        return [];
+        if (!r.ok) return;
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (line) onBatch(pathsToRoutes(JSON.parse(line).paths, strategyIndex));
+          }
+        }
+        if (buf.trim()) onBatch(pathsToRoutes(JSON.parse(buf).paths, strategyIndex));
+      } catch (e) {
+        console.warn("fetchStrategy error:", e);
       }
     }
 
@@ -381,28 +393,34 @@
       document.getElementById("route-list").innerHTML = "<span style='color:#999;font-size:12px'>Loading…</span>";
       status.textContent = "Routing…";
 
-      const allResults = await Promise.all(STRATEGIES.map((_, i) => fetchStrategy(from, to, i)));
-      routes = allResults.flat().slice(0, MAX_ROUTES);
+      let fitted = false;
+
+      function addBatch(newRoutes) {
+        const available = MAX_ROUTES - routes.length;
+        if (!available) return;
+        const toAdd = newRoutes.slice(0, available);
+        const startIdx = routes.length;
+        routes.push(...toAdd);
+        toAdd.forEach((r, j) => {
+          const i = startIdx + j;
+          setRoute(i, r.coords);
+          styleRoute(i, i === 0);
+        });
+        if (!fitted) { fitted = true; fitToAllRoutes(); }
+        status.textContent = routes[0].summary;
+        document.getElementById("route-list").innerHTML = routes.map((r, i) =>
+          `<button class="route-btn${i === primaryIndex ? " active" : ""}" onclick="promote(${i})">
+             ${r.label} · ${r.summary}
+           </button>`
+        ).join("");
+      }
+
+      await Promise.all(STRATEGIES.map((_, i) => fetchStrategy(from, to, i, addBatch)));
 
       if (!routes.length) {
         status.textContent = "No routes found";
         document.getElementById("route-list").innerHTML = "";
-        return;
       }
-
-      routes.forEach((r, i) => {
-        setRoute(i, r.coords);
-        styleRoute(i, i === 0);
-      });
-
-      fitToAllRoutes();
-      status.textContent = routes[0].summary;
-
-      document.getElementById("route-list").innerHTML = routes.map((r, i) =>
-        `<button class="route-btn${i === 0 ? " active" : ""}" onclick="promote(${i})">
-           ${r.label} · ${r.summary}
-         </button>`
-      ).join("");
     }
   </script>
 </body>
