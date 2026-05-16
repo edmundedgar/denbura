@@ -450,12 +450,12 @@ def _interest_hash(interest: str, prefectures: list) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple:
-    """Return (pois, osm_tags) for the given interest, fetching from LLM on first call."""
+    """Return (pois, osm_tags, emoji) for the given interest, fetching from LLM on first call."""
     prefectures = prefectures or []
     h = _interest_hash(interest, prefectures)
     if h in _interest_cache:
         cached = _interest_cache[h]
-        return cached["pois"], cached.get("osm_tags", {})
+        return cached["pois"], cached.get("osm_tags", {}), cached.get("emoji", "✨")
 
     os.makedirs(POI_CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(POI_CACHE_DIR, f"{h}.json")
@@ -464,9 +464,10 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
             data = json.load(f)
         pois = data["pois"] if isinstance(data, dict) else data
         osm_tags = data.get("osm_tags", {}) if isinstance(data, dict) else {}
+        emoji = data.get("emoji", "✨") if isinstance(data, dict) else "✨"
         log.info(f"Loaded {len(pois)} cached POIs for {interest!r}")
-        _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags}
-        return pois, osm_tags
+        _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags, "emoji": emoji}
+        return pois, osm_tags, emoji
 
     if prefectures:
         geo_clause = f"focusing on {'、'.join(prefectures)} and immediately adjacent areas"
@@ -474,7 +475,8 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
         geo_clause = "across Japan"
     prompt = (
         f'List up to 50 "{interest}" {geo_clause}. '
-        f"Return a JSON object only, with no markdown or code fences, with two keys:\n"
+        f"Return a JSON object only, with no markdown or code fences, with three keys:\n"
+        f'- "emoji": a single emoji character that best represents this type of place\n'
         f'- "osm_tags": an object of OSM key=value pairs that would match these places in OpenStreetMap '
         f'(e.g. {{"amenity": "fast_food", "brand": "マクドナルド"}})\n'
         f'- "pois": an array of up to 50 objects, each: '
@@ -502,18 +504,18 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
 
     text = re.sub(r"```[a-z]*\n?", "", text).strip()
     osm_tags: dict = {}
+    emoji: str = "✨"
     pois: list = []
-    # Try parsing as the new object format first
     obj_m = re.search(r"\{.*\}", text, re.DOTALL)
     if obj_m:
         try:
             data = json.loads(obj_m.group())
             if isinstance(data, dict) and "pois" in data:
                 osm_tags = data.get("osm_tags") or {}
+                emoji = data.get("emoji") or "✨"
                 pois = data["pois"]
         except json.JSONDecodeError:
             pass
-    # Fall back to legacy bare array
     if not pois:
         arr_m = re.search(r"\[.*\]", text, re.DOTALL)
         if arr_m:
@@ -523,7 +525,7 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
                 log.warning(f"JSON parse error for {interest!r}: {e}")
     if not pois:
         log.warning(f"No usable JSON in LLM response for {interest!r}")
-        return [], {}
+        return [], {}, "✨"
 
     pois = [p for p in pois if isinstance(p, dict)
             and isinstance(p.get("lat"), (int, float))
@@ -531,13 +533,13 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
             and p.get("name")]
 
     with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump({"prompt": prompt, "interest": interest,
-                   "prefectures": prefectures, "osm_tags": osm_tags, "pois": pois},
+        json.dump({"prompt": prompt, "interest": interest, "prefectures": prefectures,
+                   "emoji": emoji, "osm_tags": osm_tags, "pois": pois},
                   f, ensure_ascii=False, indent=2)
 
-    log.info(f"Fetched and cached {len(pois)} POIs + osm_tags={osm_tags} for {interest!r}")
-    _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags}
-    return pois, osm_tags
+    log.info(f"Fetched and cached {len(pois)} POIs emoji={emoji!r} osm_tags={osm_tags} for {interest!r}")
+    _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags, "emoji": emoji}
+    return pois, osm_tags, emoji
 
 
 def _route_bbox(lonlat: list, pad_deg: float = 0.1) -> tuple:
@@ -957,7 +959,7 @@ async def route(request: Request):
                 prefs = _prefectures_along_route(paths[0]["points"]["coordinates"])
                 log.info(f"Route prefectures: {prefs}")
                 yield json.dumps({"progress": f"Searching for {interest}…"}) + "\n"
-                interest_pois, osm_tags = await _fetch_interest_pois(interest, prefs)
+                interest_pois, osm_tags, interest_emoji = await _fetch_interest_pois(interest, prefs)
                 bbox = _route_bbox(paths[0]["points"]["coordinates"])
                 overpass_pois = await _fetch_overpass_pois(osm_tags, bbox)
                 interest_pois = _merge_pois(interest_pois, overpass_pois)
@@ -1026,6 +1028,7 @@ async def route(request: Request):
                 payload: dict = {"paths": via_paths}
                 if all_interest_pois:
                     payload["interest_pois"] = all_interest_pois
+                    payload["interest_emoji"] = interest_emoji
                 yield json.dumps(payload) + "\n"
 
         t.report(f"route {profile} {start_ll} → {end_ll}")

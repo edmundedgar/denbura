@@ -101,6 +101,7 @@
     let activeChargerEl = null;
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
     let activeInterestEl = null;
+    let interestEmoji = "✨";
     let clickCycle = null; // { key: string, indices: number[], pos: number }
 
     const map = new maplibregl.Map({
@@ -193,11 +194,6 @@
 
     const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
 
-    const POI_STYLES = {
-      charger:    { bg: "#00b300", activeBg: "#7b2fbe" },
-      hot_spring: { bg: "#e07000", activeBg: "#7b2fbe" },
-    };
-
     function hoverPopup(marker) {
       const el = marker.getElement();
       el.addEventListener("mouseenter", () => {
@@ -208,28 +204,28 @@
       });
     }
 
-    function makeMarkerEl(bg) {
+    function makePoiMarkerEl(emoji, active) {
       const el = document.createElement("div");
-      el.style.cssText = [
-        "width:14px", "height:14px", "border-radius:50%",
-        `background:${bg}`, "border:2px solid #fff",
-        "box-shadow:0 1px 3px rgba(0,0,0,.4)", "cursor:pointer",
-      ].join(";");
+      el.textContent = emoji;
+      el.dataset.emoji = emoji;
+      if (active) {
+        el.style.cssText = [
+          "font-size:20px", "line-height:1", "cursor:pointer", "user-select:none",
+          "background:rgba(255,255,255,0.92)", "border:2.5px solid rgba(100,60,180,0.9)",
+          "border-radius:6px", "padding:2px 5px",
+          "filter:drop-shadow(0 1px 4px rgba(0,0,0,.55))",
+        ].join(";");
+      } else {
+        el.style.cssText = [
+          "font-size:16px", "line-height:1", "cursor:pointer", "user-select:none",
+          "filter:drop-shadow(0 1px 2px rgba(0,0,0,.55))",
+          "opacity:0.8",
+        ].join(";");
+      }
       return el;
     }
 
-    function makeInterestMarkerEl(active) {
-      const el = document.createElement("div");
-      const size = active ? 15 : 11;
-      el.style.cssText = [
-        `width:${size}px`, `height:${size}px`,
-        `background:${active ? "#7b2fbe" : "#f59e0b"}`,
-        `border:${active ? "2.5px" : "2px"} solid rgba(255,255,255,${active ? ".95" : ".85"})`,
-        `box-shadow:0 ${active ? "2px 7px" : "1px 4px"} rgba(0,0,0,${active ? ".55" : ".4"})`,
-        "transform:rotate(45deg)", "cursor:pointer",
-      ].join(";");
-      return el;
-    }
+    function makeInterestMarkerEl(active) { return makePoiMarkerEl(interestEmoji, active); }
 
     function clearInterestMarkers() {
       if (activeInterestEl) { activeInterestEl = null; }
@@ -282,7 +278,7 @@
       const r = await fetch("flash_chargers.json");
       const chargers = await r.json();
       for (const c of chargers) {
-        const el = makeMarkerEl(POI_STYLES.charger.bg);
+        const el = makePoiMarkerEl("⚡", false);
         const lines = [
           `<strong>${c.name}</strong>`,
           c.address    ? c.address : null,
@@ -305,7 +301,7 @@
         const r = await fetch("hot_springs.json");
         const springs = await r.json();
         for (const s of springs) {
-          const el = makeMarkerEl(POI_STYLES.hot_spring.bg);
+          const el = makePoiMarkerEl("♨", false);
           const lines = [
             `<strong>${s.name}</strong>`,
             s.opening_hours ? `営業: ${s.opening_hours}` : null,
@@ -394,6 +390,7 @@
         activeChargerEl = null;
       }
       clearInterestMarkers();
+      interestEmoji = "✨";
       clickCycle = null;
     }
 
@@ -424,10 +421,8 @@
       document.getElementById("status").textContent = routes[index].summary;
 
       if (activeChargerEl) {
-        const prev = routes[oldIndex]?.via_poi;
-        activeChargerEl.style.background = prev
-          ? (POI_STYLES[prev.type]?.bg ?? "#00b300")
-          : "#00b300";
+        const emoji = activeChargerEl.dataset.emoji || "⚡";
+        activeChargerEl.style.cssText = makePoiMarkerEl(emoji, false).style.cssText;
         activeChargerEl = null;
       }
       const poi = routes[index]?.via_poi;
@@ -441,7 +436,11 @@
             activeInterestEl = null;
           }
           const el = chargerEls.get(`${poi.lat},${poi.lon}`);
-          if (el) { el.style.background = "#7b2fbe"; activeChargerEl = el; }
+          if (el) {
+            const emoji = el.dataset.emoji || "⚡";
+            el.style.cssText = makePoiMarkerEl(emoji, true).style.cssText;
+            activeChargerEl = el;
+          }
         }
       } else {
         // no via_poi — reset interest highlight too
@@ -473,8 +472,9 @@
       }
       if (path.via_poi) {
         const p = path.via_poi;
+        const icon = p.type === "interest" ? interestEmoji : p.type === "hot_spring" ? "♨" : "⚡";
         const extra = p.max_output ? ` ${p.max_output}` : p.description ? ` — ${p.description}` : "";
-        return `${km} km · ${timeStr}${tollStr}${chargeStr} · via ${p.name}${extra}`;
+        return `${km} km · ${timeStr}${tollStr}${chargeStr} · via ${icon} ${p.name}${extra}`;
       }
       return `${km} km · ${timeStr}${tollStr}${chargeStr}`;
     }
@@ -498,10 +498,10 @@
         label:        (() => {
                         if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
                         const poi = path.via_poi;
-                        const icon = poi.type === "hot_spring" ? "♨" : poi.type === "interest" ? "✨" : "⚡";
+                        const icon = poi.type === "hot_spring" ? "♨" : poi.type === "interest" ? interestEmoji : "⚡";
                         let lbl = `${icon} ${poi.name}`;
                         if (poi.secondary) {
-                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : poi.secondary.type === "interest" ? "✨" : "⚡";
+                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : poi.secondary.type === "interest" ? interestEmoji : "⚡";
                           lbl += ` → ${icon2} ${poi.secondary.name}`;
                         }
                         return lbl;
@@ -544,6 +544,7 @@
               if (data.progress) {
                 showProgress(data.progress);
               } else {
+                if (data.interest_emoji) interestEmoji = data.interest_emoji;
                 onBatch(pathsToRoutes(data.paths, strategyIndex));
                 if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
               }
