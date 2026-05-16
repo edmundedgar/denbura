@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
+# Secrets
+.env
+
 # Data — large downloaded files
 data/osm/
 data/dem/*.tif
@@ -29,6 +32,9 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# LLM-generated POI cache — raw responses and processed JSON, rebuilt on demand
+data/pois/
 
 # Note: data/toll_ics_auto.json and data/toll_ics_overrides.json are tracked
 # (generated but slow to rebuild; small enough to commit)

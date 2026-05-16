@@ -8,3 +8,5 @@ httpx
 tifffile
 imagecodecs
 osmium
+anthropic
+python-dotenv

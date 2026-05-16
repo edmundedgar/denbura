@@ -4,8 +4,11 @@ import json
 import logging
 import math
 import os
+import re
 import time
 
+import anthropic
+import dotenv
 import httpx
 import numpy as np
 import tifffile
@@ -13,6 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 from scipy.spatial import cKDTree
 
+dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("denbura")
 
@@ -37,6 +41,11 @@ NEARBY_ONSEN_RADIUS_M   =   5_000   # onsens within 5 km of a charger count as c
 MAX_CHARGER_CANDIDATES  =       5
 MAX_NEARBY_ONSENS       =       2
 MAX_CORRIDOR_ONSENS     =       5
+MAX_INTEREST_CANDIDATES =       6
+NEARBY_INTEREST_CHARGER_M = 20_000  # look for a charger within 20 km of an interest POI
+INTEREST_DETOUR_RATIO     =    1.5  # interest POIs allow up to 50% extra road distance
+
+POI_CACHE_DIR = "data/pois"
 
 # Map our profile names to Valhalla auto costing options
 _PROFILE_OPTS = {
@@ -358,6 +367,162 @@ def _trip_to_path(trip: dict, via_poi: dict | None = None) -> dict:
     return path
 
 # ---------------------------------------------------------------------------
+# Prefecture bounding boxes for route geographic context (min_lat, max_lat, min_lon, max_lon)
+# ---------------------------------------------------------------------------
+
+_PREF_BBOX = [
+    ("北海道",   41.35, 45.55, 139.34, 148.89),
+    ("青森県",   40.20, 41.56, 139.89, 141.68),
+    ("岩手県",   38.74, 40.44, 140.54, 142.07),
+    ("宮城県",   37.77, 39.00, 140.27, 141.68),
+    ("秋田県",   38.87, 40.53, 139.63, 141.07),
+    ("山形県",   37.75, 39.22, 139.66, 140.72),
+    ("福島県",   36.79, 37.97, 139.00, 141.05),
+    ("茨城県",   35.73, 36.80, 139.69, 140.85),
+    ("栃木県",   36.20, 37.15, 139.33, 140.34),
+    ("群馬県",   36.12, 37.14, 138.41, 139.69),
+    ("埼玉県",   35.74, 36.29, 138.73, 139.92),
+    ("千葉県",   34.90, 36.10, 139.73, 140.91),
+    ("東京都",   35.50, 35.90, 138.94, 139.92),
+    ("神奈川県", 35.13, 35.68, 139.00, 139.86),
+    ("新潟県",   36.76, 38.57, 137.61, 139.96),
+    ("富山県",   36.49, 37.03, 136.77, 137.72),
+    ("石川県",   36.13, 37.59, 136.29, 137.35),
+    ("福井県",   35.43, 36.29, 135.69, 136.79),
+    ("山梨県",   35.21, 35.94, 138.46, 139.23),
+    ("長野県",   35.22, 37.00, 137.29, 138.86),
+    ("岐阜県",   35.10, 36.73, 136.28, 137.71),
+    ("静岡県",   34.57, 35.52, 137.47, 139.16),
+    ("愛知県",   34.57, 35.44, 136.67, 137.81),
+    ("三重県",   33.73, 35.26, 135.85, 136.90),
+    ("滋賀県",   34.83, 35.73, 135.73, 136.62),
+    ("京都府",   34.74, 35.79, 135.04, 135.86),
+    ("大阪府",   34.27, 34.98, 135.13, 135.75),
+    ("兵庫県",   34.19, 35.68, 134.28, 135.49),
+    ("奈良県",   33.86, 35.12, 135.57, 136.24),
+    ("和歌山県", 33.44, 34.61, 135.13, 136.02),
+    ("鳥取県",   35.10, 35.64, 133.25, 134.28),
+    ("島根県",   34.56, 35.71, 131.67, 133.58),
+    ("岡山県",   34.55, 35.26, 133.24, 134.50),
+    ("広島県",   34.05, 35.21, 132.16, 133.45),
+    ("山口県",   33.71, 34.77, 130.76, 132.11),
+    ("徳島県",   33.56, 34.38, 133.68, 134.76),
+    ("香川県",   34.01, 34.45, 133.52, 134.56),
+    ("愛媛県",   32.90, 33.93, 132.01, 133.69),
+    ("高知県",   32.70, 34.12, 132.52, 134.33),
+    ("福岡県",   33.09, 34.25, 130.08, 131.20),
+    ("佐賀県",   33.06, 33.66, 129.72, 130.56),
+    ("長崎県",   32.59, 34.72, 128.59, 130.29),
+    ("熊本県",   32.05, 33.42, 130.03, 131.43),
+    ("大分県",   32.73, 33.71, 130.74, 132.10),
+    ("宮崎県",   31.37, 32.83, 130.67, 131.87),
+    ("鹿児島県", 27.04, 32.01, 128.43, 131.26),
+    ("沖縄県",   24.04, 27.09, 122.93, 131.33),
+]
+
+def _prefectures_along_route(lonlat: list) -> list:
+    """Return prefecture names the route passes through, deduplicated in order."""
+    if not lonlat:
+        return []
+    n = len(lonlat)
+    step = max(1, n // 12)
+    samples = [lonlat[i] for i in range(0, n, step)] + [lonlat[-1]]
+    seen: set = set()
+    result: list = []
+    for lon, lat in samples:
+        for name, mn_lat, mx_lat, mn_lon, mx_lon in _PREF_BBOX:
+            if mn_lat <= lat <= mx_lat and mn_lon <= lon <= mx_lon:
+                if name not in seen:
+                    seen.add(name)
+                    result.append(name)
+                break
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Interest POI fetching (LLM-backed, disk-cached)
+# ---------------------------------------------------------------------------
+
+_interest_cache: dict = {}   # slug → list of POI dicts
+
+def _interest_slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower().strip()).strip("-")
+
+async def _fetch_interest_pois(interest: str, prefectures: list = None) -> list:
+    """Return POIs for the given free-text interest, fetching from LLM on first call."""
+    pref_key = "-".join(_interest_slug(p) for p in (prefectures or []))
+    slug = _interest_slug(interest) + (f"__{pref_key}" if pref_key else "")
+    if slug in _interest_cache:
+        return _interest_cache[slug]
+
+    cache_path = os.path.join(POI_CACHE_DIR, f"{slug}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            pois = json.load(f)
+        log.info(f"Loaded {len(pois)} cached POIs for {interest!r} ({pref_key or 'japan'})")
+        _interest_cache[slug] = pois
+        return pois
+
+    os.makedirs(POI_CACHE_DIR, exist_ok=True)
+    raw_path = os.path.join(POI_CACHE_DIR, f"{slug}.raw")
+
+    if os.path.exists(raw_path):
+        log.info(f"Re-processing cached LLM response for {interest!r}")
+        with open(raw_path, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        log.info(f"Fetching POIs from LLM for interest: {interest!r} prefectures={prefectures}")
+        if prefectures:
+            pref_str = "、".join(prefectures)
+            geo_clause = f"focusing on {pref_str} and immediately adjacent areas"
+        else:
+            geo_clause = "across Japan"
+        prompt = (
+            f'List the 20 most remarkable "{interest}" {geo_clause} that a tourist on a road trip might '
+            f"want to detour to visit. Return a JSON array only, with no markdown or code fences. "
+            f'Each item: {{"name": "Japanese name", "name_en": "English name", '
+            f'"lat": <float>, "lon": <float>, "description": "one sentence why it is remarkable"}}'
+        )
+        llm = anthropic.Anthropic()
+        msg = await asyncio.to_thread(
+            llm.messages.create,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = msg.content[0].text
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    # Strip markdown code fences if present
+    text = re.sub(r"```[a-z]*\n?", "", text).strip()
+
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if not m:
+        log.warning(f"No JSON array in LLM response for {interest!r}")
+        return []
+
+    try:
+        pois = json.loads(m.group())
+    except json.JSONDecodeError as e:
+        log.warning(f"JSON parse error for {interest!r}: {e}")
+        return []
+
+    pois = [p for p in pois if isinstance(p, dict)
+            and isinstance(p.get("lat"), (int, float))
+            and isinstance(p.get("lon"), (int, float))
+            and p.get("name")]
+
+    os.makedirs(POI_CACHE_DIR, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(pois, f, ensure_ascii=False, indent=2)
+
+    log.info(f"Fetched and cached {len(pois)} POIs for {interest!r}")
+    _interest_cache[slug] = pois
+    return pois
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app + POI data
 # ---------------------------------------------------------------------------
 
@@ -547,14 +712,18 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
             if toll:
                 total_toll += toll
 
-        # Primary stop is the charger (if any), otherwise the first stop
-        primary = next((s for s in stops if s["type"] == "charger"), stops[0])
+        # Interest POIs take visual priority; charger is primary only if no interest stop
+        primary = next((s for s in stops if s["type"] == "interest"), None)
+        if primary is None:
+            primary = next((s for s in stops if s["type"] == "charger"), stops[0])
         d = primary["data"]
         via_poi: dict = {
             "type":          primary["type"],
-            "name":          d["name"],
+            "name":          d.get("name_en") or d.get("name", ""),
+            "name_ja":       d.get("name", ""),
             "lat":           primary["lat"],
             "lon":           primary["lon"],
+            "description":   d.get("description", ""),
             "max_output":    d.get("max_output", ""),
             "address":       d.get("address", ""),
             "opening_hours": d.get("opening_hours", ""),
@@ -563,9 +732,10 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
         others = [s for s in stops if s is not primary]
         if others:
             sec = others[0]
+            sec_d = sec["data"]
             via_poi["secondary"] = {
                 "type": sec["type"],
-                "name": sec["data"]["name"],
+                "name": sec_d.get("name_en") or sec_d.get("name", ""),
                 "lat":  sec["lat"],
                 "lon":  sec["lon"],
             }
@@ -705,7 +875,49 @@ async def route(request: Request):
                               "lat": best_o["lat"], "lon": best_o["lon"], "data": best_o}
                     via_tasks.append([o_stop])
 
-            t.mark(f"Stages 2-4: {len(via_tasks)} candidates (charge={charge_need})")
+            # Stage 4b: user interest POIs along the corridor
+            all_interest_pois: list = []  # corridor candidates sent to frontend for map display
+            interest = body.get("interest", "").strip()
+            if interest:
+                prefs = _prefectures_along_route(paths[0]["points"]["coordinates"])
+                log.info(f"Route prefectures: {prefs}")
+                interest_pois = await _fetch_interest_pois(interest, prefs)
+                interest_clusters = _build_clusters(interest_pois)
+                d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
+                d_max    = d_direct * INTEREST_DETOUR_RATIO
+                corridor: list = []
+                for c in interest_clusters:
+                    da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
+                    db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
+                    if da + db > d_max:
+                        continue
+                    if d_direct > 0 and da > 0:
+                        cos_a = (da**2 + d_direct**2 - db**2) / (2 * da * d_direct)
+                        perp  = da * math.sqrt(max(0.0, 1 - max(-1.0, min(1.0, cos_a))**2))
+                        if perp > MAX_POI_PERP_M:
+                            continue
+                    corridor.append((da + db - d_direct, c))
+                corridor.sort()
+                for _, c in corridor:
+                    all_interest_pois.extend(c["members"])
+                for _, ic in corridor[:MAX_INTEREST_CANDIDATES]:
+                    best_p = min(ic["members"],
+                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                    p_stop = {"type": "interest",
+                              "lat": best_p["lat"], "lon": best_p["lon"], "data": best_p}
+                    via_tasks.append([p_stop])
+                    # Also try: interest POI → nearby charger
+                    for cc in _find_nearby_clusters("charger", best_p["lat"], best_p["lon"],
+                                                    NEARBY_INTEREST_CHARGER_M, max_n=2):
+                        best_c = min(cc["members"],
+                                     key=lambda m: _haversine_m(
+                                         best_p["lat"], best_p["lon"], m["lat"], m["lon"]))
+                        c_stop = {"type": "charger",
+                                  "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
+                        via_tasks.append([p_stop, c_stop])
+
+            t.mark(f"Stages 2-4b: {len(via_tasks)} candidates (charge={charge_need})")
 
             # Stage 5: route all candidates in parallel
             poi_results = await asyncio.gather(
@@ -719,14 +931,19 @@ async def route(request: Request):
             for pp in poi_results:
                 if pp is None:
                     continue
-                if pp["distance"] <= direct_dist * DETOUR_MAX_RATIO:
+                poi_type = pp.get("via_poi", {}).get("type")
+                ratio = INTEREST_DETOUR_RATIO if poi_type == "interest" else DETOUR_MAX_RATIO
+                if pp["distance"] <= direct_dist * ratio:
                     via_paths.append(pp)
                     if len(via_paths) >= MAX_POI_ROUTES:
                         break
             t.mark(f"filtered to {len(via_paths)} via-POI routes")
 
             if via_paths:
-                yield json.dumps({"paths": via_paths}) + "\n"
+                payload: dict = {"paths": via_paths}
+                if all_interest_pois:
+                    payload["interest_pois"] = all_interest_pois
+                yield json.dumps(payload) + "\n"
 
         t.report(f"route {profile} {start_ll} → {end_ll}")
 

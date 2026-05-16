@@ -45,6 +45,8 @@
     <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center;cursor:pointer">
       <input type="checkbox" id="show-onsens" onchange="applyOnsenToggle()"> ♨ Onsens
     </label>
+    <input id="interest" placeholder="✨ Interests (e.g. impressive waterfalls)"
+           style="width:240px" title="Describe what you'd like to see on the way">
     <span id="status"></span>
   </div>
   <div id="route-list"></div>
@@ -68,6 +70,8 @@
     const chargerEls = new Map(); // "lat,lon" → marker element
     const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
+    const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
+    let activeInterestEl = null;
 
     const map = new maplibregl.Map({
       container: "map",
@@ -146,6 +150,16 @@
       hot_spring: { bg: "#e07000", activeBg: "#7b2fbe" },
     };
 
+    function hoverPopup(marker) {
+      const el = marker.getElement();
+      el.addEventListener("mouseenter", () => {
+        if (!marker.getPopup().isOpen()) marker.togglePopup();
+      });
+      el.addEventListener("mouseleave", () => {
+        if (marker.getPopup().isOpen()) marker.togglePopup();
+      });
+    }
+
     function makeMarkerEl(bg) {
       const el = document.createElement("div");
       el.style.cssText = [
@@ -154,6 +168,66 @@
         "box-shadow:0 1px 3px rgba(0,0,0,.4)", "cursor:pointer",
       ].join(";");
       return el;
+    }
+
+    function makeInterestMarkerEl(active) {
+      const el = document.createElement("div");
+      const size = active ? 15 : 11;
+      el.style.cssText = [
+        `width:${size}px`, `height:${size}px`,
+        `background:${active ? "#7b2fbe" : "#f59e0b"}`,
+        `border:${active ? "2.5px" : "2px"} solid rgba(255,255,255,${active ? ".95" : ".85"})`,
+        `box-shadow:0 ${active ? "2px 7px" : "1px 4px"} rgba(0,0,0,${active ? ".55" : ".4"})`,
+        "transform:rotate(45deg)", "cursor:pointer",
+      ].join(";");
+      return el;
+    }
+
+    function clearInterestMarkers() {
+      if (activeInterestEl) { activeInterestEl = null; }
+      interestMarkers.forEach(m => m.remove());
+      interestMarkers.clear();
+    }
+
+    function showInterestPOIs(pois) {
+      // deduplicate by lat,lon
+      const seen = new Set(interestMarkers.keys());
+      for (const poi of pois) {
+        const key = `${poi.lat},${poi.lon}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const el = makeInterestMarkerEl(false);
+        const lines = [
+          poi.name_en ? `<strong>${poi.name_en}</strong>` : `<strong>${poi.name || ""}</strong>`,
+          poi.name_en && poi.name ? `<em>${poi.name}</em>` : null,
+          poi.description || null,
+        ].filter(Boolean).join("<br>");
+        const marker = new maplibregl.Marker({ element: el })
+          .setLngLat([poi.lon, poi.lat])
+          .setPopup(new maplibregl.Popup({ maxWidth: "260px", closeButton: false, closeOnClick: false }).setHTML(lines))
+          .addTo(map);
+        hoverPopup(marker);
+        interestMarkers.set(key, marker);
+      }
+      // highlight the one on the currently active route
+      highlightActiveInterest();
+    }
+
+    function highlightActiveInterest() {
+      // reset all to inactive style
+      if (activeInterestEl) {
+        activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+        activeInterestEl = null;
+      }
+      const poi = routes[primaryIndex]?.via_poi;
+      if (poi?.type === "interest") {
+        const m = interestMarkers.get(`${poi.lat},${poi.lon}`);
+        if (m) {
+          const el = m.getElement();
+          el.style.cssText = makeInterestMarkerEl(true).style.cssText;
+          activeInterestEl = el;
+        }
+      }
     }
 
     async function loadChargers() {
@@ -170,10 +244,10 @@
           c.connector_types ? c.connector_types.join(" / ") : null,
           c.status === "under_adjustment" ? "<em>調整中</em>" : null,
         ].filter(Boolean).join("<br>");
-        new maplibregl.Marker({ element: el })
+        hoverPopup(new maplibregl.Marker({ element: el })
           .setLngLat([c.lon, c.lat])
-          .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
-          .addTo(map);
+          .setPopup(new maplibregl.Popup({ maxWidth: "280px", closeButton: false, closeOnClick: false }).setHTML(lines))
+          .addTo(map));
         chargerEls.set(`${c.lat},${c.lon}`, el);
       }
     }
@@ -190,10 +264,10 @@
             s.fee           ? `料金: ${s.fee}` : null,
             s.website       ? `<a href="${s.website}" target="_blank">website</a>` : null,
           ].filter(Boolean).join("<br>");
-          new maplibregl.Marker({ element: el })
+          hoverPopup(new maplibregl.Marker({ element: el })
             .setLngLat([s.lon, s.lat])
-            .setPopup(new maplibregl.Popup({ maxWidth: "280px" }).setHTML(lines))
-            .addTo(map);
+            .setPopup(new maplibregl.Popup({ maxWidth: "280px", closeButton: false, closeOnClick: false }).setHTML(lines))
+            .addTo(map));
           chargerEls.set(`${s.lat},${s.lon}`, el);
           hotSpringEls.push(el);
         }
@@ -219,6 +293,7 @@
         document.getElementById("show-onsens").checked = p.get("onsens") === "1";
         applyOnsenToggle();
       }
+      if (p.has("interest")) document.getElementById("interest").value = p.get("interest");
       return true;
     }
 
@@ -252,6 +327,7 @@
           : "#00b300";
         activeChargerEl = null;
       }
+      clearInterestMarkers();
     }
 
     function styleRoute(index, active) {
@@ -288,8 +364,23 @@
       }
       const poi = routes[index]?.via_poi;
       if (poi) {
-        const el = chargerEls.get(`${poi.lat},${poi.lon}`);
-        if (el) { el.style.background = "#7b2fbe"; activeChargerEl = el; }
+        if (poi.type === "interest") {
+          highlightActiveInterest();
+        } else {
+          // reset any previously highlighted interest marker
+          if (activeInterestEl) {
+            activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+            activeInterestEl = null;
+          }
+          const el = chargerEls.get(`${poi.lat},${poi.lon}`);
+          if (el) { el.style.background = "#7b2fbe"; activeChargerEl = el; }
+        }
+      } else {
+        // no via_poi — reset interest highlight too
+        if (activeInterestEl) {
+          activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+          activeInterestEl = null;
+        }
       }
     }
 
@@ -314,7 +405,7 @@
       }
       if (path.via_poi) {
         const p = path.via_poi;
-        const extra = p.max_output ? ` ${p.max_output}` : "";
+        const extra = p.max_output ? ` ${p.max_output}` : p.description ? ` — ${p.description}` : "";
         return `${km} km · ${timeStr}${tollStr}${chargeStr} · via ${p.name}${extra}`;
       }
       return `${km} km · ${timeStr}${tollStr}${chargeStr}`;
@@ -339,11 +430,11 @@
         label:        (() => {
                         if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
                         const poi = path.via_poi;
-                        const icon = poi.type === "hot_spring" ? "♨" : "⚡";
+                        const icon = poi.type === "hot_spring" ? "♨" : poi.type === "interest" ? "✨" : "⚡";
                         let lbl = `${icon} ${poi.name}`;
                         if (poi.secondary) {
-                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : "⚡";
-                          lbl += ` + ${icon2}`;
+                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : poi.secondary.type === "interest" ? "✨" : "⚡";
+                          lbl += ` → ${icon2} ${poi.secondary.name}`;
                         }
                         return lbl;
                       })(),
@@ -365,6 +456,7 @@
             start_charge_pct: parseFloat(document.getElementById("start-charge").value) || 80,
             poi_types: document.getElementById("show-onsens").checked
               ? ["charger", "hot_spring"] : ["charger"],
+            interest: document.getElementById("interest").value.trim(),
           }),
         });
         if (!r.ok) return;
@@ -379,10 +471,18 @@
           while ((nl = buf.indexOf("\n")) !== -1) {
             const line = buf.slice(0, nl).trim();
             buf = buf.slice(nl + 1);
-            if (line) onBatch(pathsToRoutes(JSON.parse(line).paths, strategyIndex));
+            if (line) {
+              const data = JSON.parse(line);
+              onBatch(pathsToRoutes(data.paths, strategyIndex));
+              if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+            }
           }
         }
-        if (buf.trim()) onBatch(pathsToRoutes(JSON.parse(buf).paths, strategyIndex));
+        if (buf.trim()) {
+          const data = JSON.parse(buf);
+          onBatch(pathsToRoutes(data.paths, strategyIndex));
+          if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+        }
       } catch (e) {
         console.warn("fetchStrategy error:", e);
       }
@@ -412,10 +512,12 @@
         return;
       }
 
+      const interestVal = document.getElementById("interest").value.trim();
       const params = new URLSearchParams({
         from: fromVal, to: toVal,
         charge: document.getElementById("start-charge").value,
         onsens: document.getElementById("show-onsens").checked ? "1" : "0",
+        ...(interestVal ? { interest: interestVal } : {}),
       });
       const url = "#!" + params.toString();
       if (pushHistory) history.pushState(null, "", url);
