@@ -100,6 +100,7 @@
     const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
+    const interestPOIs = new Map();    // "lat,lon" → mutable poi dict (for post-render enrichment)
     let activeInterestEl = null;
     let interestEmoji = "✨";
     let clickCycle = null; // { key: string, indices: number[], pos: number }
@@ -238,35 +239,66 @@
       if (activeInterestEl) { activeInterestEl = null; }
       interestMarkers.forEach(m => m.remove());
       interestMarkers.clear();
+      interestPOIs.clear();
+    }
+
+    function poiPopupHTML(poi) {
+      const linkParts = [
+        poi.website   ? `<a href="${poi.website}" target="_blank" rel="noopener">website</a>` : null,
+        poi.wikipedia ? `<a href="${poi.wikipedia}" target="_blank" rel="noopener">Wikipedia</a>` : null,
+      ].filter(Boolean);
+      return [
+        poi.name_en ? `<strong>${poi.name_en}</strong>` : `<strong>${poi.name || ""}</strong>`,
+        poi.name_en && poi.name ? `<em>${poi.name}</em>` : null,
+        poi.description || null,
+        linkParts.length ? linkParts.join(" · ") : null,
+      ].filter(Boolean).join("<br>");
     }
 
     function showInterestPOIs(pois) {
-      // deduplicate by lat,lon
       const seen = new Set(interestMarkers.keys());
       for (const poi of pois) {
         const key = `${poi.lat},${poi.lon}`;
         if (seen.has(key)) continue;
         seen.add(key);
         const el = makeInterestMarkerEl(false);
-        const linkParts = [
-          poi.website   ? `<a href="${poi.website}" target="_blank" rel="noopener">website</a>` : null,
-          poi.wikipedia ? `<a href="${poi.wikipedia}" target="_blank" rel="noopener">Wikipedia</a>` : null,
-        ].filter(Boolean);
-        const lines = [
-          poi.name_en ? `<strong>${poi.name_en}</strong>` : `<strong>${poi.name || ""}</strong>`,
-          poi.name_en && poi.name ? `<em>${poi.name}</em>` : null,
-          poi.description || null,
-          linkParts.length ? linkParts.join(" · ") : null,
-        ].filter(Boolean).join("<br>");
         const marker = new maplibregl.Marker({ element: el })
           .setLngLat([poi.lon, poi.lat])
-          .setPopup(new maplibregl.Popup({ maxWidth: "260px", closeButton: false, closeOnClick: false }).setHTML(lines))
+          .setPopup(new maplibregl.Popup({ maxWidth: "260px", closeButton: false, closeOnClick: false }).setHTML(poiPopupHTML(poi)))
           .addTo(map);
         hoverPopup(marker);
         interestMarkers.set(key, marker);
+        interestPOIs.set(key, poi);
       }
-      // highlight the one on the currently active route
       highlightActiveInterest();
+      enrichWithWikipedia(pois);
+    }
+
+    async function enrichWithWikipedia(pois) {
+      const unlinked = pois.filter(p => !p.wikipedia && (p.name || p.name_en));
+      for (const poi of unlinked) {
+        const key = `${poi.lat},${poi.lon}`;
+        if (!interestMarkers.has(key)) continue; // markers cleared (new search started)
+        try {
+          // Try Japanese name first, fall back to English
+          const searches = [poi.name, poi.name_en].filter(Boolean);
+          let wikiUrl = null;
+          for (const term of searches) {
+            const lang = term === poi.name ? "ja" : "en";
+            const params = new URLSearchParams({ action: "query", list: "search", srsearch: term,
+              format: "json", origin: "*", srlimit: 1, srnamespace: 0 });
+            const data = await fetch(`https://${lang}.wikipedia.org/w/api.php?${params}`).then(r => r.json());
+            const hit = data?.query?.search?.[0];
+            if (hit) {
+              wikiUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(hit.title).replace(/%20/g, "_")}`;
+              break;
+            }
+          }
+          if (!wikiUrl || !interestMarkers.has(key)) continue;
+          poi.wikipedia = wikiUrl;
+          interestMarkers.get(key).getPopup().setHTML(poiPopupHTML(poi));
+        } catch (_) { /* ignore network errors */ }
+      }
     }
 
     function highlightActiveInterest() {
