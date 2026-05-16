@@ -10,7 +10,7 @@
     body { display: flex; flex-direction: column; height: 100vh; font-family: sans-serif; }
     #controls {
       display: flex; gap: 8px; padding: 10px;
-      background: #fff; border-bottom: 1px solid #ddd; flex-shrink: 0;
+      background: #fff; flex-shrink: 0;
     }
     #controls input {
       flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px;
@@ -20,7 +20,10 @@
       border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
     }
     #controls button:hover { background: #005fa3; }
-    #status { font-size: 13px; color: #555; align-self: center; white-space: nowrap; }
+    #status {
+      padding: 5px 10px; background: #fff; border-bottom: 1px solid #eee;
+      font-size: 13px; color: #555; flex-shrink: 0; min-height: 26px;
+    }
     #route-bar {
       display: flex; align-items: flex-start; flex-shrink: 0;
       background: #f8f8f8; border-bottom: 1px solid #e0e0e0;
@@ -57,8 +60,8 @@
     </label>
     <input id="interest" placeholder="✨ Interests (e.g. impressive waterfalls)"
            style="width:240px" title="Describe what you'd like to see on the way">
-    <span id="status"></span>
   </div>
+  <div id="status"></div>
   <div id="route-bar">
     <div id="route-list"></div>
     <button id="list-toggle" onclick="toggleRouteList()" title="Collapse route list">▼</button>
@@ -71,8 +74,8 @@
     const EV_BATTERY_KWH = 82.5;
 
     const STRATEGIES = [
-      { profile: "car_motorway", label: "Exp",   color: "#0078d4", dimColor: "#90bfe8" },
-      { profile: "car_local",    label: "Local",  color: "#c47000", dimColor: "#dda860" },
+      { profile: "car_motorway", label: "Exp",   color: "#0078d4", dimColor: "#5ea8db" },
+      { profile: "car_local",    label: "Local",  color: "#c47000", dimColor: "#d99440" },
     ];
 
     const MAX_ROUTES = 12;
@@ -85,6 +88,7 @@
     let activeChargerEl = null;
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
     let activeInterestEl = null;
+    let clickCycle = null; // { key: string, indices: number[], pos: number }
 
     const map = new maplibregl.Map({
       container: "map",
@@ -95,12 +99,28 @@
 
     map.addControl(new maplibregl.NavigationControl());
 
+    const routeLayerIds = Array.from({length: MAX_ROUTES}, (_, i) => `route-${i}`);
+
     map.on("click", (e) => {
-      const layerIds = Array.from({length: MAX_ROUTES}, (_, i) => `route-${i}`);
-      const hit = map.queryRenderedFeatures(e.point, { layers: layerIds });
-      if (hit.length) return;
-      const { lat, lng } = e.lngLat;
-      document.getElementById(focusedInput).value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+      const hits = map.queryRenderedFeatures(e.point, { layers: routeLayerIds });
+      const hitIndices = [...new Set(hits.map(f => parseInt(f.layer.id.split("-")[1])))].filter(i => routes[i]);
+
+      if (!hitIndices.length) {
+        clickCycle = null;
+        const { lat, lng } = e.lngLat;
+        document.getElementById(focusedInput).value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+        return;
+      }
+
+      const key = hitIndices.join(",");
+      if (clickCycle?.key === key) {
+        clickCycle.pos = (clickCycle.pos + 1) % hitIndices.length;
+      } else {
+        // First click at this spot: start just after the current primary (if present)
+        const primaryPos = hitIndices.indexOf(primaryIndex);
+        clickCycle = { key, indices: hitIndices, pos: (primaryPos + 1) % hitIndices.length };
+      }
+      promote(hitIndices[clickCycle.pos]);
     });
 
     map.on("load", () => {
@@ -117,10 +137,9 @@
 
       for (let i = 0; i < MAX_ROUTES; i++) {
         map.on("mouseenter", `route-${i}`, () => {
-          if (routes[i] && i !== primaryIndex) map.getCanvas().style.cursor = "pointer";
+          if (routes[i]) map.getCanvas().style.cursor = "pointer";
         });
         map.on("mouseleave", `route-${i}`, () => { map.getCanvas().style.cursor = ""; });
-        map.on("click", `route-${i}`, () => { if (routes[i] && i !== primaryIndex) promote(i); });
       }
 
       loadChargers();
@@ -349,6 +368,7 @@
         activeChargerEl = null;
       }
       clearInterestMarkers();
+      clickCycle = null;
     }
 
     function styleRoute(index, active) {
@@ -356,18 +376,19 @@
       if (!r) return;
       let color, dimColor;
       if (r.via_poi) {
-        color = "#7b2fbe"; dimColor = "#b48fd4";
+        color = "#7b2fbe"; dimColor = "#9e68c8";
       } else {
         const s = STRATEGIES[r.strategyIndex];
         color = s.color; dimColor = s.dimColor;
       }
       map.setPaintProperty(`route-${index}`, "line-color", active ? color : dimColor);
-      map.setPaintProperty(`route-${index}`, "line-width", active ? 4 : 2);
-      map.setPaintProperty(`route-${index}`, "line-opacity", active ? 1 : 0.7);
+      map.setPaintProperty(`route-${index}`, "line-width", active ? 6 : 3);
+      map.setPaintProperty(`route-${index}`, "line-opacity", active ? 1 : 0.65);
     }
 
     function promote(index) {
-      styleRoute(primaryIndex, false);
+      const oldIndex = primaryIndex;
+      styleRoute(oldIndex, false);
       styleRoute(index, true);
       map.moveLayer(`route-${index}`);
       primaryIndex = index;
@@ -377,7 +398,7 @@
       document.getElementById("status").textContent = routes[index].summary;
 
       if (activeChargerEl) {
-        const prev = routes[primaryIndex]?.via_poi;
+        const prev = routes[oldIndex]?.via_poi;
         activeChargerEl.style.background = prev
           ? (POI_STYLES[prev.type]?.bg ?? "#00b300")
           : "#00b300";
