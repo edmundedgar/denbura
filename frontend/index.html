@@ -21,10 +21,20 @@
     }
     #controls button:hover { background: #005fa3; }
     #status { font-size: 13px; color: #555; align-self: center; white-space: nowrap; }
-    #route-list {
-      display: flex; gap: 6px; padding: 5px 10px; flex-wrap: wrap;
-      background: #f8f8f8; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; min-height: 32px;
+    #route-bar {
+      display: flex; align-items: flex-start; flex-shrink: 0;
+      background: #f8f8f8; border-bottom: 1px solid #e0e0e0;
     }
+    #route-list {
+      display: flex; gap: 6px; padding: 5px 10px; flex-wrap: wrap; flex: 1; min-height: 32px;
+    }
+    #route-bar.collapsed #route-list { display: none; }
+    #list-toggle {
+      padding: 4px 8px; border: none; background: transparent;
+      cursor: pointer; font-size: 13px; color: #999; flex-shrink: 0;
+      align-self: flex-end; margin-left: auto;
+    }
+    #list-toggle:hover { color: #555; }
     .route-btn {
       padding: 3px 10px; border-radius: 10px; font-size: 12px; cursor: pointer;
       border: 1.5px solid #ccc; background: #fff; color: #666;
@@ -49,7 +59,10 @@
            style="width:240px" title="Describe what you'd like to see on the way">
     <span id="status"></span>
   </div>
-  <div id="route-list"></div>
+  <div id="route-bar">
+    <div id="route-list"></div>
+    <button id="list-toggle" onclick="toggleRouteList()" title="Collapse route list">▼</button>
+  </div>
   <div id="map"></div>
 
   <script>
@@ -278,6 +291,14 @@
     function applyOnsenToggle() {
       const show = document.getElementById("show-onsens").checked;
       hotSpringEls.forEach(el => { el.style.display = show ? "" : "none"; });
+    }
+
+    function toggleRouteList() {
+      const bar = document.getElementById("route-bar");
+      const btn = document.getElementById("list-toggle");
+      const collapsed = bar.classList.toggle("collapsed");
+      btn.textContent = collapsed ? "▲" : "▼";
+      btn.title = collapsed ? "Expand route list" : "Collapse route list";
     }
 
     function loadFromHash() {
