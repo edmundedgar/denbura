@@ -196,11 +196,18 @@
 
     function hoverPopup(marker) {
       const el = marker.getElement();
-      el.addEventListener("mouseenter", () => {
-        if (!marker.getPopup().isOpen()) marker.togglePopup();
-      });
-      el.addEventListener("mouseleave", () => {
-        if (marker.getPopup().isOpen()) marker.togglePopup();
+      let timer = null;
+      const scheduleClose = () => {
+        timer = setTimeout(() => { if (marker.getPopup().isOpen()) marker.togglePopup(); }, 150);
+      };
+      const cancelClose = () => { clearTimeout(timer); };
+      el.addEventListener("mouseenter", () => { cancelClose(); if (!marker.getPopup().isOpen()) marker.togglePopup(); });
+      el.addEventListener("mouseleave", scheduleClose);
+      marker.getPopup().on("open", () => {
+        const popupEl = marker.getPopup().getElement();
+        if (!popupEl) return;
+        popupEl.addEventListener("mouseenter", cancelClose);
+        popupEl.addEventListener("mouseleave", scheduleClose);
       });
     }
 
@@ -241,10 +248,15 @@
         if (seen.has(key)) continue;
         seen.add(key);
         const el = makeInterestMarkerEl(false);
+        const linkParts = [
+          poi.website   ? `<a href="${poi.website}" target="_blank" rel="noopener">website</a>` : null,
+          poi.wikipedia ? `<a href="${poi.wikipedia}" target="_blank" rel="noopener">Wikipedia</a>` : null,
+        ].filter(Boolean);
         const lines = [
           poi.name_en ? `<strong>${poi.name_en}</strong>` : `<strong>${poi.name || ""}</strong>`,
           poi.name_en && poi.name ? `<em>${poi.name}</em>` : null,
           poi.description || null,
+          linkParts.length ? linkParts.join(" · ") : null,
         ].filter(Boolean).join("<br>");
         const marker = new maplibregl.Marker({ element: el })
           .setLngLat([poi.lon, poi.lat])

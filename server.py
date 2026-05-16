@@ -542,6 +542,14 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
     return pois, osm_tags, emoji
 
 
+_overpass_cache: dict = {}  # hash → list of POI dicts
+
+
+def _overpass_hash(osm_tags: dict, bbox: tuple) -> str:
+    key = json.dumps(osm_tags, sort_keys=True) + "\n" + ",".join(f"{v:.4f}" for v in bbox)
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def _route_bbox(lonlat: list, pad_deg: float = 0.1) -> tuple:
     lats = [p[1] for p in lonlat]
     lons = [p[0] for p in lonlat]
@@ -552,6 +560,21 @@ def _route_bbox(lonlat: list, pad_deg: float = 0.1) -> tuple:
 async def _fetch_overpass_pois(osm_tags: dict, bbox: tuple) -> list:
     if not osm_tags:
         return []
+
+    h = _overpass_hash(osm_tags, bbox)
+    if h in _overpass_cache:
+        return _overpass_cache[h]
+
+    os.makedirs(POI_CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(POI_CACHE_DIR, f"overpass_{h}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+        pois = data["pois"]
+        log.info(f"Loaded {len(pois)} cached Overpass POIs")
+        _overpass_cache[h] = pois
+        return pois
+
     min_lat, min_lon, max_lat, max_lon = bbox
     bbox_str = f"{min_lat},{min_lon},{max_lat},{max_lon}"
     tag_filters = "".join(f'["{k}"="{v}"]' for k, v in osm_tags.items())
@@ -563,10 +586,13 @@ async def _fetch_overpass_pois(osm_tags: dict, bbox: tuple) -> list:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                "https://overpass-api.de/api/interpreter",
+                "https://overpass.kumi.systems/api/interpreter",
                 data={"data": query},
             )
-        elements = resp.json().get("elements", [])
+            if resp.status_code != 200:
+                log.warning(f"Overpass HTTP {resp.status_code}: {resp.text[:300]}")
+                return []
+            elements = resp.json().get("elements", [])
     except Exception as e:
         log.warning(f"Overpass query failed: {e}")
         return []
@@ -579,22 +605,40 @@ async def _fetch_overpass_pois(osm_tags: dict, bbox: tuple) -> list:
         name = tags.get("name") or tags.get("brand") or tags.get("name:en")
         if not (lat and lon and name):
             continue
+        wiki_url = None
+        wiki_tag = tags.get("wikipedia", "")
+        if wiki_tag:
+            parts = wiki_tag.split(":", 1)
+            lang, title = (parts[0], parts[1]) if len(parts) == 2 else ("ja", wiki_tag)
+            wiki_url = f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}"
         pois.append({
             "name": name,
             "name_en": tags.get("name:en") or tags.get("brand:en") or name,
             "lat": lat,
             "lon": lon,
             "description": "",
+            "website": tags.get("website") or tags.get("contact:website") or None,
+            "wikipedia": wiki_url,
         })
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump({"osm_tags": osm_tags, "bbox": list(bbox), "pois": pois},
+                  f, ensure_ascii=False, indent=2)
     log.info(f"Overpass returned {len(pois)} POIs")
+    _overpass_cache[h] = pois
     return pois
 
 
 def _merge_pois(primary: list, secondary: list, dedup_m: float = 200) -> list:
     result = list(primary)
     for p in secondary:
-        if not any(_haversine_m(p["lat"], p["lon"], q["lat"], q["lon"]) < dedup_m
-                   for q in result):
+        match = next((q for q in result
+                      if _haversine_m(p["lat"], p["lon"], q["lat"], q["lon"]) < dedup_m), None)
+        if match:
+            for field in ("website", "wikipedia"):
+                if p.get(field) and not match.get(field):
+                    match[field] = p[field]
+        else:
             result.append(p)
     return result
 
