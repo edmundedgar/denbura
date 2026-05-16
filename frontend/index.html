@@ -44,6 +44,19 @@
     }
     .route-btn.active { border-color: #0078d4; color: #0078d4; background: #e8f1fb; font-weight: 600; }
     #map { flex: 1; }
+    #progress {
+      display: flex; align-items: center; gap: 7px;
+      padding: 4px 10px; font-size: 12px; color: #666;
+      background: #f0f4ff; border-bottom: 1px solid #d8e4f8; flex-shrink: 0;
+    }
+    #progress[hidden] { display: none; }
+    #progress::before {
+      content: ""; flex-shrink: 0;
+      width: 11px; height: 11px; border-radius: 50%;
+      border: 2px solid #c0d0f0; border-top-color: #0078d4;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -62,6 +75,7 @@
            style="width:240px" title="Describe what you'd like to see on the way">
   </div>
   <div id="status"></div>
+  <div id="progress" hidden></div>
   <div id="route-bar">
     <div id="route-list"></div>
     <button id="list-toggle" onclick="toggleRouteList()" title="Collapse route list">▼</button>
@@ -314,6 +328,16 @@
       hotSpringEls.forEach(el => { el.style.display = show ? "" : "none"; });
     }
 
+    function showProgress(msg) {
+      const el = document.getElementById("progress");
+      el.textContent = msg;
+      el.hidden = false;
+    }
+
+    function clearProgress() {
+      document.getElementById("progress").hidden = true;
+    }
+
     function toggleRouteList() {
       const bar = document.getElementById("route-bar");
       const btn = document.getElementById("list-toggle");
@@ -517,15 +541,23 @@
             buf = buf.slice(nl + 1);
             if (line) {
               const data = JSON.parse(line);
-              onBatch(pathsToRoutes(data.paths, strategyIndex));
-              if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+              if (data.progress) {
+                showProgress(data.progress);
+              } else {
+                onBatch(pathsToRoutes(data.paths, strategyIndex));
+                if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+              }
             }
           }
         }
         if (buf.trim()) {
           const data = JSON.parse(buf);
-          onBatch(pathsToRoutes(data.paths, strategyIndex));
-          if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+          if (data.progress) {
+            showProgress(data.progress);
+          } else {
+            onBatch(pathsToRoutes(data.paths, strategyIndex));
+            if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+          }
         }
       } catch (e) {
         console.warn("fetchStrategy error:", e);
@@ -568,6 +600,7 @@
       else history.replaceState(null, "", url);
 
       clearRoutes();
+      clearProgress();
       routes = [];
       primaryIndex = 0;
       document.getElementById("route-list").innerHTML = "<span style='color:#999;font-size:12px'>Loading…</span>";
@@ -596,6 +629,7 @@
       }
 
       await Promise.all(STRATEGIES.map((_, i) => fetchStrategy(from, to, i, addBatch)));
+      clearProgress();
 
       if (!routes.length) {
         status.textContent = "No routes found";
