@@ -48,8 +48,8 @@
 </head>
 <body>
   <div id="controls">
-    <input id="from" value="益子" placeholder="from — place name or lat,lon" onfocus="focusedInput='from'">
-    <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon"  onfocus="focusedInput='to'">
+    <input id="from" value="益子" placeholder="from — place name or lat,lon">
+    <input id="to"   value="宇都宮" placeholder="to — place name or lat,lon">
     <button onclick="getRoute()">Route</button>
     <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center">
       Start <input id="start-charge" type="number" min="0" max="100" value="100"
@@ -80,7 +80,6 @@
 
     const MAX_ROUTES = 12;
 
-    let focusedInput = "to";
     let primaryIndex = 0;
     let routes = []; // [{coords, label, summary, strategyIndex}]
     const chargerEls = new Map(); // "lat,lon" → marker element
@@ -107,8 +106,11 @@
 
       if (!hitIndices.length) {
         clickCycle = null;
-        const { lat, lng } = e.lngLat;
-        document.getElementById(focusedInput).value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+        const active = document.activeElement;
+        if (active === document.getElementById("from") || active === document.getElementById("to")) {
+          const { lat, lng } = e.lngLat;
+          active.value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+        }
         return;
       }
 
