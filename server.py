@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -435,7 +436,6 @@ def _prefectures_along_route(lonlat: list) -> list:
                 if name not in seen:
                     seen.add(name)
                     result.append(name)
-                break
     return result
 
 
@@ -443,83 +443,158 @@ def _prefectures_along_route(lonlat: list) -> list:
 # Interest POI fetching (LLM-backed, disk-cached)
 # ---------------------------------------------------------------------------
 
-_interest_cache: dict = {}   # slug → list of POI dicts
+_interest_cache: dict = {}   # hash → {"pois": [...], "osm_tags": {...}}
 
-def _interest_slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower().strip()).strip("-")
+def _interest_hash(interest: str, prefectures: list) -> str:
+    key = interest.strip().lower() + "\n" + "\n".join(sorted(prefectures))
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
-async def _fetch_interest_pois(interest: str, prefectures: list = None) -> list:
-    """Return POIs for the given free-text interest, fetching from LLM on first call."""
-    pref_key = "-".join(_interest_slug(p) for p in (prefectures or []))
-    slug = _interest_slug(interest) + (f"__{pref_key}" if pref_key else "")
-    if slug in _interest_cache:
-        return _interest_cache[slug]
-
-    cache_path = os.path.join(POI_CACHE_DIR, f"{slug}.json")
-    if os.path.exists(cache_path):
-        with open(cache_path, encoding="utf-8") as f:
-            pois = json.load(f)
-        log.info(f"Loaded {len(pois)} cached POIs for {interest!r} ({pref_key or 'japan'})")
-        _interest_cache[slug] = pois
-        return pois
+async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple:
+    """Return (pois, osm_tags) for the given interest, fetching from LLM on first call."""
+    prefectures = prefectures or []
+    h = _interest_hash(interest, prefectures)
+    if h in _interest_cache:
+        cached = _interest_cache[h]
+        return cached["pois"], cached.get("osm_tags", {})
 
     os.makedirs(POI_CACHE_DIR, exist_ok=True)
-    raw_path = os.path.join(POI_CACHE_DIR, f"{slug}.raw")
+    cache_path = os.path.join(POI_CACHE_DIR, f"{h}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+        pois = data["pois"] if isinstance(data, dict) else data
+        osm_tags = data.get("osm_tags", {}) if isinstance(data, dict) else {}
+        log.info(f"Loaded {len(pois)} cached POIs for {interest!r}")
+        _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags}
+        return pois, osm_tags
 
+    if prefectures:
+        geo_clause = f"focusing on {'、'.join(prefectures)} and immediately adjacent areas"
+    else:
+        geo_clause = "across Japan"
+    prompt = (
+        f'List up to 50 "{interest}" {geo_clause}. '
+        f"Return a JSON object only, with no markdown or code fences, with two keys:\n"
+        f'- "osm_tags": an object of OSM key=value pairs that would match these places in OpenStreetMap '
+        f'(e.g. {{"amenity": "fast_food", "brand": "マクドナルド"}})\n'
+        f'- "pois": an array of up to 50 objects, each: '
+        f'{{"name": "Japanese name", "name_en": "English name", '
+        f'"lat": <float>, "lon": <float>, "description": "one sentence"}}'
+    )
+
+    raw_path = os.path.join(POI_CACHE_DIR, f"{h}.raw")
     if os.path.exists(raw_path):
         log.info(f"Re-processing cached LLM response for {interest!r}")
         with open(raw_path, encoding="utf-8") as f:
             text = f.read()
     else:
         log.info(f"Fetching POIs from LLM for interest: {interest!r} prefectures={prefectures}")
-        if prefectures:
-            pref_str = "、".join(prefectures)
-            geo_clause = f"focusing on {pref_str} and immediately adjacent areas"
-        else:
-            geo_clause = "across Japan"
-        prompt = (
-            f'List the 20 most remarkable "{interest}" {geo_clause} that a tourist on a road trip might '
-            f"want to detour to visit. Return a JSON array only, with no markdown or code fences. "
-            f'Each item: {{"name": "Japanese name", "name_en": "English name", '
-            f'"lat": <float>, "lon": <float>, "description": "one sentence why it is remarkable"}}'
-        )
         llm = anthropic.Anthropic()
         msg = await asyncio.to_thread(
             llm.messages.create,
             model="claude-haiku-4-5-20251001",
-            max_tokens=4096,
+            max_tokens=8192,
             messages=[{"role": "user", "content": prompt}],
         )
         text = msg.content[0].text
         with open(raw_path, "w", encoding="utf-8") as f:
             f.write(text)
 
-    # Strip markdown code fences if present
     text = re.sub(r"```[a-z]*\n?", "", text).strip()
-
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        log.warning(f"No JSON array in LLM response for {interest!r}")
-        return []
-
-    try:
-        pois = json.loads(m.group())
-    except json.JSONDecodeError as e:
-        log.warning(f"JSON parse error for {interest!r}: {e}")
-        return []
+    osm_tags: dict = {}
+    pois: list = []
+    # Try parsing as the new object format first
+    obj_m = re.search(r"\{.*\}", text, re.DOTALL)
+    if obj_m:
+        try:
+            data = json.loads(obj_m.group())
+            if isinstance(data, dict) and "pois" in data:
+                osm_tags = data.get("osm_tags") or {}
+                pois = data["pois"]
+        except json.JSONDecodeError:
+            pass
+    # Fall back to legacy bare array
+    if not pois:
+        arr_m = re.search(r"\[.*\]", text, re.DOTALL)
+        if arr_m:
+            try:
+                pois = json.loads(arr_m.group())
+            except json.JSONDecodeError as e:
+                log.warning(f"JSON parse error for {interest!r}: {e}")
+    if not pois:
+        log.warning(f"No usable JSON in LLM response for {interest!r}")
+        return [], {}
 
     pois = [p for p in pois if isinstance(p, dict)
             and isinstance(p.get("lat"), (int, float))
             and isinstance(p.get("lon"), (int, float))
             and p.get("name")]
 
-    os.makedirs(POI_CACHE_DIR, exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(pois, f, ensure_ascii=False, indent=2)
+        json.dump({"prompt": prompt, "interest": interest,
+                   "prefectures": prefectures, "osm_tags": osm_tags, "pois": pois},
+                  f, ensure_ascii=False, indent=2)
 
-    log.info(f"Fetched and cached {len(pois)} POIs for {interest!r}")
-    _interest_cache[slug] = pois
+    log.info(f"Fetched and cached {len(pois)} POIs + osm_tags={osm_tags} for {interest!r}")
+    _interest_cache[h] = {"pois": pois, "osm_tags": osm_tags}
+    return pois, osm_tags
+
+
+def _route_bbox(lonlat: list, pad_deg: float = 0.1) -> tuple:
+    lats = [p[1] for p in lonlat]
+    lons = [p[0] for p in lonlat]
+    return (min(lats) - pad_deg, min(lons) - pad_deg,
+            max(lats) + pad_deg, max(lons) + pad_deg)
+
+
+async def _fetch_overpass_pois(osm_tags: dict, bbox: tuple) -> list:
+    if not osm_tags:
+        return []
+    min_lat, min_lon, max_lat, max_lon = bbox
+    bbox_str = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+    tag_filters = "".join(f'["{k}"="{v}"]' for k, v in osm_tags.items())
+    query = (
+        f"[out:json][timeout:25];\n"
+        f"(node{tag_filters}({bbox_str});way{tag_filters}({bbox_str}););\n"
+        f"out center;"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+            )
+        elements = resp.json().get("elements", [])
+    except Exception as e:
+        log.warning(f"Overpass query failed: {e}")
+        return []
+
+    pois = []
+    for el in elements:
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        tags = el.get("tags", {})
+        name = tags.get("name") or tags.get("brand") or tags.get("name:en")
+        if not (lat and lon and name):
+            continue
+        pois.append({
+            "name": name,
+            "name_en": tags.get("name:en") or tags.get("brand:en") or name,
+            "lat": lat,
+            "lon": lon,
+            "description": "",
+        })
+    log.info(f"Overpass returned {len(pois)} POIs")
     return pois
+
+
+def _merge_pois(primary: list, secondary: list, dedup_m: float = 200) -> list:
+    result = list(primary)
+    for p in secondary:
+        if not any(_haversine_m(p["lat"], p["lon"], q["lat"], q["lon"]) < dedup_m
+                   for q in result):
+            result.append(p)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +956,11 @@ async def route(request: Request):
             if interest:
                 prefs = _prefectures_along_route(paths[0]["points"]["coordinates"])
                 log.info(f"Route prefectures: {prefs}")
-                interest_pois = await _fetch_interest_pois(interest, prefs)
+                yield json.dumps({"progress": f"Searching for {interest}…"}) + "\n"
+                interest_pois, osm_tags = await _fetch_interest_pois(interest, prefs)
+                bbox = _route_bbox(paths[0]["points"]["coordinates"])
+                overpass_pois = await _fetch_overpass_pois(osm_tags, bbox)
+                interest_pois = _merge_pois(interest_pois, overpass_pois)
                 interest_clusters = _build_clusters(interest_pois)
                 d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
                 d_max    = d_direct * INTEREST_DETOUR_RATIO
@@ -918,6 +997,10 @@ async def route(request: Request):
                         via_tasks.append([p_stop, c_stop])
 
             t.mark(f"Stages 2-4b: {len(via_tasks)} candidates (charge={charge_need})")
+
+            if via_tasks:
+                n = len(via_tasks)
+                yield json.dumps({"progress": f"Finding best routes via {n} candidate stop{'s' if n != 1 else ''}…"}) + "\n"
 
             # Stage 5: route all candidates in parallel
             poi_results = await asyncio.gather(
