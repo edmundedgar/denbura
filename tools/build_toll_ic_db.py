@@ -19,6 +19,7 @@ Usage:
 import json
 import math
 import os
+import re
 import sys
 import osmium
 from collections import defaultdict
@@ -93,7 +94,7 @@ class Pass1Handler(osmium.SimpleHandler):
 
     def way(self, w):
         tags = dict(w.tags)
-        if tags.get("highway") not in ("motorway", "motorway_link"):
+        if tags.get("highway") not in ("motorway", "motorway_link", "trunk", "trunk_link"):
             return
         if tags.get("toll") != "yes":
             return
@@ -204,13 +205,14 @@ for nid, booth_op in p1.booths.items():
     for key in p1.node_to_roads.get(nid, set()):
         p1.roads[key]["booth_ops"].add(booth_op)
 
-# Filter: keep roads with at least one confirmed non-NEXCO/non-urban operator.
-# A road qualifies if its way-level operator OR any booth operator is non-empty
-# and not on the skip list.
+# Filter: include roads unless there is evidence they are NEXCO/urban.
+# Roads without any operator tag are included unless they carry an E-number ref,
+# which is the national numbering system used exclusively by NEXCO expressways.
 keep: dict = {}
 for key, road in p1.roads.items():
     way_op    = road["way_op"]
     booth_ops = road["booth_ops"]
+    ref       = road["ref"]
 
     all_ops = ([way_op] if way_op else []) + list(booth_ops)
 
@@ -218,20 +220,20 @@ for key, road in p1.roads.items():
     if _is_skip_road_name(road["name"]):
         continue
 
-    # If any operator is NEXCO/urban → skip
+    # Skip if any operator is NEXCO/urban
     if any(_is_skip(op) for op in all_ops if op):
         continue
 
-    # Need at least one positive operator signal (way or booth) to avoid
-    # pulling in NEXCO roads that simply lack operator tags.
-    non_empty = [op for op in all_ops if op]
-    if not non_empty:
+    # Skip E-number refs (E1, E4, E4A …) with no confirmed non-NEXCO operator —
+    # all NEXCO motorways carry an E-number; prefectural roads do not.
+    non_skip_ops = [op for op in all_ops if op and not _is_skip(op)]
+    if re.match(r'^E\d', ref) and not non_skip_ops:
         continue
 
     keep[key] = {
         "name":     road["name"],
         "ref":      road["ref"],
-        "operator": non_empty[0],
+        "operator": non_skip_ops[0] if non_skip_ops else "",
         "node_ids": road["node_ids"],
     }
 
