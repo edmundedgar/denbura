@@ -1046,7 +1046,23 @@ async def route(request: Request):
 
             if via_tasks:
                 n = len(via_tasks)
-                yield json.dumps({"progress": f"Finding best routes via {n} candidate stop{'s' if n != 1 else ''}…"}) + "\n"
+                seen_coords: set = set()
+                candidates: list = []
+                for stops in via_tasks:
+                    for stop in stops:
+                        key = (round(stop["lat"], 5), round(stop["lon"], 5))
+                        if key not in seen_coords:
+                            seen_coords.add(key)
+                            candidates.append({"type": stop["type"],
+                                               "lat": stop["lat"], "lon": stop["lon"]})
+                progress_chunk: dict = {
+                    "progress": f"Finding best routes via {n} candidate stop{'s' if n != 1 else ''}…",
+                    "candidates": candidates,
+                }
+                if all_interest_pois:
+                    progress_chunk["interest_pois"] = all_interest_pois
+                    progress_chunk["interest_emoji"] = interest_emoji
+                yield json.dumps(progress_chunk) + "\n"
 
             # Stage 5: route all candidates in parallel
             poi_results = await asyncio.gather(
@@ -1069,11 +1085,7 @@ async def route(request: Request):
             t.mark(f"filtered to {len(via_paths)} via-POI routes")
 
             if via_paths:
-                payload: dict = {"paths": via_paths}
-                if all_interest_pois:
-                    payload["interest_pois"] = all_interest_pois
-                    payload["interest_emoji"] = interest_emoji
-                yield json.dumps(payload) + "\n"
+                yield json.dumps({"paths": via_paths}) + "\n"
 
         t.report(f"route {profile} {start_ll} → {end_ll}")
 

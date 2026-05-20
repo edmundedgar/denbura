@@ -99,6 +99,7 @@
     const chargerEls = new Map(); // "lat,lon" → marker element
     const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
+    const candidateEls = new Set(); // marker elements currently highlighted as route candidates
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
     const interestPOIs = new Map();    // "lat,lon" → mutable poi dict (for post-render enrichment)
     let activeInterestEl = null;
@@ -212,7 +213,7 @@
       });
     }
 
-    function makePoiMarkerEl(emoji, active) {
+    function makePoiMarkerEl(emoji, active, candidate = false) {
       const el = document.createElement("div");
       el.textContent = emoji;
       el.dataset.emoji = emoji;
@@ -223,6 +224,12 @@
           "border-radius:6px", "padding:2px 5px",
           "filter:drop-shadow(0 1px 4px rgba(0,0,0,.55))",
         ].join(";");
+      } else if (candidate) {
+        el.style.cssText = [
+          "font-size:18px", "line-height:1", "cursor:pointer", "user-select:none",
+          "border:2.5px solid rgba(220,140,0,0.9)", "border-radius:50%", "padding:3px",
+          "box-shadow:0 1px 4px rgba(0,0,0,.5)",
+        ].join(";");
       } else {
         el.style.cssText = [
           "font-size:15px", "line-height:1", "cursor:pointer", "user-select:none",
@@ -231,6 +238,26 @@
         ].join(";");
       }
       return el;
+    }
+
+    function clearCandidates() {
+      candidateEls.forEach(el => {
+        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
+      });
+      candidateEls.clear();
+    }
+
+    function setCandidates(candidates) {
+      clearCandidates();
+      for (const c of candidates) {
+        const key = `${c.lat},${c.lon}`;
+        const el = c.type === "interest"
+          ? interestMarkers.get(key)?.getElement()
+          : chargerEls.get(key);
+        if (!el) continue;
+        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false, true).style.cssText;
+        candidateEls.add(el);
+      }
     }
 
     function makeInterestMarkerEl(active) { return makePoiMarkerEl(interestEmoji, active); }
@@ -274,6 +301,19 @@
       enrichWithWikipedia(pois);
     }
 
+    function _wikiTitleMatches(title, term) {
+      const t = title.toLowerCase(), s = term.toLowerCase();
+      if (t === s || t.includes(s) || s.includes(t)) return true;
+      // English: at least one significant word in common
+      const tWords = new Set(t.split(/\s+/).filter(w => w.length > 2));
+      if (s.split(/\s+/).some(w => w.length > 2 && tWords.has(w))) return true;
+      // Japanese/CJK: at least one 2-character sequence in common
+      for (let i = 0; i < s.length - 1; i++) {
+        if (/[　-鿿]/.test(s[i]) && t.includes(s.slice(i, i + 2))) return true;
+      }
+      return false;
+    }
+
     async function enrichWithWikipedia(pois) {
       const unlinked = pois.filter(p => !p.wikipedia && (p.name || p.name_en));
       for (const poi of unlinked) {
@@ -286,9 +326,9 @@
           for (const term of searches) {
             const lang = term === poi.name ? "ja" : "en";
             const params = new URLSearchParams({ action: "query", list: "search", srsearch: term,
-              format: "json", origin: "*", srlimit: 1, srnamespace: 0 });
+              format: "json", origin: "*", srlimit: 3, srnamespace: 0 });
             const data = await fetch(`https://${lang}.wikipedia.org/w/api.php?${params}`).then(r => r.json());
-            const hit = data?.query?.search?.[0];
+            const hit = (data?.query?.search || []).find(h => _wikiTitleMatches(h.title, term));
             if (hit) {
               wikiUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(hit.title).replace(/%20/g, "_")}`;
               break;
@@ -427,12 +467,10 @@
         map.setPaintProperty(`route-${i}`, "line-opacity", 0);
       }
       if (activeChargerEl) {
-        const prev = routes[primaryIndex]?.via_poi;
-        activeChargerEl.style.background = prev
-          ? (POI_STYLES[prev.type]?.bg ?? "#00b300")
-          : "#00b300";
+        activeChargerEl.style.cssText = makePoiMarkerEl(activeChargerEl.dataset.emoji || "⚡", false).style.cssText;
         activeChargerEl = null;
       }
+      clearCandidates();
       clearInterestMarkers();
       interestEmoji = "✨";
       clickCycle = null;
@@ -587,10 +625,12 @@
               const data = JSON.parse(line);
               if (data.progress) {
                 showProgress(data.progress);
-              } else {
                 if (data.interest_emoji) interestEmoji = data.interest_emoji;
-                onBatch(pathsToRoutes(data.paths, strategyIndex));
                 if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+                if (data.candidates?.length) setCandidates(data.candidates);
+              } else {
+                clearCandidates();
+                onBatch(pathsToRoutes(data.paths, strategyIndex));
               }
             }
           }
@@ -599,9 +639,12 @@
           const data = JSON.parse(buf);
           if (data.progress) {
             showProgress(data.progress);
-          } else {
-            onBatch(pathsToRoutes(data.paths, strategyIndex));
+            if (data.interest_emoji) interestEmoji = data.interest_emoji;
             if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+            if (data.candidates?.length) setCandidates(data.candidates);
+          } else {
+            clearCandidates();
+            onBatch(pathsToRoutes(data.paths, strategyIndex));
           }
         }
       } catch (e) {
