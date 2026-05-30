@@ -100,11 +100,15 @@
     const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
     const candidateEls = new Set(); // marker elements currently highlighted as route candidates
+    const candidateData = new Map(); // el → {type,lat,lon,data} for click-to-pin
+    const pinnedEls = new Set();    // marker elements pinned by the user (stay purple)
+    let pinnedStops = [];           // [{type,lat,lon,data}] in order
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
     const interestPOIs = new Map();    // "lat,lon" → mutable poi dict (for post-render enrichment)
     let activeInterestEl = null;
     let interestEmoji = "✨";
     let clickCycle = null; // { key: string, indices: number[], pos: number }
+    let lastFocusedInput = null; // track which input was last focused for map-click-to-fill
 
     const map = new maplibregl.Map({
       container: "map",
@@ -123,10 +127,9 @@
 
       if (!hitIndices.length) {
         clickCycle = null;
-        const active = document.activeElement;
-        if (active === document.getElementById("from") || active === document.getElementById("to")) {
+        if (lastFocusedInput) {
           const { lat, lng } = e.lngLat;
-          active.value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+          lastFocusedInput.value = `${lat.toFixed(5)},${lng.toFixed(5)}`;
         }
         return;
       }
@@ -192,6 +195,21 @@
       map.getCanvas().addEventListener("mouseleave", () => chargeTip.remove());
 
       if (window.location.hash.startsWith("#!")) getRoute({ pushHistory: false });
+
+      // Track which text input was last focused so map clicks can fill it.
+      // Blur fires before the map click event, so we keep lastFocusedInput alive
+      // briefly with a timeout to let the click handler see it.
+      let _blurTimer = null;
+      for (const id of ["from", "to"]) {
+        const el = document.getElementById(id);
+        el.addEventListener("focus", () => {
+          clearTimeout(_blurTimer);
+          lastFocusedInput = el;
+        });
+        el.addEventListener("blur", () => {
+          _blurTimer = setTimeout(() => { lastFocusedInput = null; }, 200);
+        });
+      }
     });
 
     const popup = new maplibregl.Popup({ closeButton: false, maxWidth: "280px" });
@@ -242,9 +260,11 @@
 
     function clearCandidates() {
       candidateEls.forEach(el => {
-        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
+        if (!pinnedEls.has(el))
+          el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
       });
       candidateEls.clear();
+      candidateData.clear();
     }
 
     function setCandidates(candidates) {
@@ -254,9 +274,22 @@
         const el = c.type === "interest"
           ? interestMarkers.get(key)?.getElement()
           : chargerEls.get(key);
-        if (!el) continue;
+        if (!el || pinnedEls.has(el)) continue;
         el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false, true).style.cssText;
         candidateEls.add(el);
+        candidateData.set(el, c);
+        el.addEventListener("click", function onPin(e) {
+          e.stopPropagation();
+          el.removeEventListener("click", onPin);
+          candidateEls.delete(el);
+          candidateData.delete(el);
+          // Promote to pinned style
+          el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", true).style.cssText;
+          el.dataset.pinned = "true";
+          pinnedEls.add(el);
+          pinnedStops.push({type: c.type, lat: c.lat, lon: c.lon, data: c.data});
+          getRoute({ pushHistory: true, keepPinned: true });
+        });
       }
     }
 
@@ -342,9 +375,9 @@
     }
 
     function highlightActiveInterest() {
-      // reset all to inactive style
       if (activeInterestEl) {
-        activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+        if (!pinnedEls.has(activeInterestEl))
+          activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
         activeInterestEl = null;
       }
       const poi = routes[primaryIndex]?.via_poi;
@@ -352,8 +385,10 @@
         const m = interestMarkers.get(`${poi.lat},${poi.lon}`);
         if (m) {
           const el = m.getElement();
-          el.style.cssText = makeInterestMarkerEl(true).style.cssText;
-          activeInterestEl = el;
+          if (!pinnedEls.has(el)) {
+            el.style.cssText = makeInterestMarkerEl(true).style.cssText;
+            activeInterestEl = el;
+          }
         }
       }
     }
@@ -440,14 +475,38 @@
         applyOnsenToggle();
       }
       if (p.has("interest")) document.getElementById("interest").value = p.get("interest");
+      const pinsParam = p.get("pins");
+      if (pinsParam) {
+        try {
+          pinnedStops = JSON.parse(pinsParam).map(([type, lat, lon, name, name_en]) => ({
+            type, lat, lon, data: { name, name_en }
+          }));
+        } catch { pinnedStops = []; }
+      } else {
+        pinnedStops = [];
+      }
       return true;
+    }
+
+    function _decodePinsFromHash() {
+      const hash = window.location.hash;
+      if (!hash.startsWith("#!")) return [];
+      const p = new URLSearchParams(hash.slice(2));
+      const pinsParam = p.get("pins");
+      if (!pinsParam) return [];
+      try {
+        return JSON.parse(pinsParam).map(([type, lat, lon, name, name_en]) => ({
+          type, lat, lon, data: { name, name_en }
+        }));
+      } catch { return []; }
     }
 
     // Populate fields immediately (before map finishes loading)
     loadFromHash();
 
     window.addEventListener("popstate", () => {
-      if (loadFromHash()) getRoute({ pushHistory: false });
+      const pins = _decodePinsFromHash();
+      if (loadFromHash()) getRoute({ pushHistory: false, restoredPins: pins });
     });
 
     function emptyGeoJSON() {
@@ -466,14 +525,33 @@
         map.getSource(`route-${i}`).setData(emptyGeoJSON());
         map.setPaintProperty(`route-${i}`, "line-opacity", 0);
       }
-      if (activeChargerEl) {
+      if (activeChargerEl && !pinnedEls.has(activeChargerEl)) {
         activeChargerEl.style.cssText = makePoiMarkerEl(activeChargerEl.dataset.emoji || "⚡", false).style.cssText;
-        activeChargerEl = null;
       }
+      activeChargerEl = null;
+      if (activeInterestEl && !pinnedEls.has(activeInterestEl)) {
+        activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+      }
+      activeInterestEl = null;
       clearCandidates();
       clearInterestMarkers();
       interestEmoji = "✨";
       clickCycle = null;
+    }
+
+    // Re-apply purple style to any markers that match the current pinnedStops list.
+    // Safe to call multiple times; called after charger load and after interest POIs appear.
+    function restorePinnedVisuals() {
+      for (const stop of pinnedStops) {
+        const key = `${stop.lat},${stop.lon}`;
+        const el = stop.type === "interest"
+          ? interestMarkers.get(key)?.getElement()
+          : chargerEls.get(key);
+        if (!el || pinnedEls.has(el)) continue;
+        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", true).style.cssText;
+        el.dataset.pinned = "true";
+        pinnedEls.add(el);
+      }
     }
 
     function styleRoute(index, active) {
@@ -503,8 +581,10 @@
       document.getElementById("status").textContent = routes[index].summary;
 
       if (activeChargerEl) {
-        const emoji = activeChargerEl.dataset.emoji || "⚡";
-        activeChargerEl.style.cssText = makePoiMarkerEl(emoji, false).style.cssText;
+        if (!pinnedEls.has(activeChargerEl)) {
+          const emoji = activeChargerEl.dataset.emoji || "⚡";
+          activeChargerEl.style.cssText = makePoiMarkerEl(emoji, false).style.cssText;
+        }
         activeChargerEl = null;
       }
       const poi = routes[index]?.via_poi;
@@ -512,22 +592,22 @@
         if (poi.type === "interest") {
           highlightActiveInterest();
         } else {
-          // reset any previously highlighted interest marker
           if (activeInterestEl) {
-            activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+            if (!pinnedEls.has(activeInterestEl))
+              activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
             activeInterestEl = null;
           }
           const el = chargerEls.get(`${poi.lat},${poi.lon}`);
-          if (el) {
+          if (el && !pinnedEls.has(el)) {
             const emoji = el.dataset.emoji || "⚡";
             el.style.cssText = makePoiMarkerEl(emoji, true).style.cssText;
             activeChargerEl = el;
           }
         }
       } else {
-        // no via_poi — reset interest highlight too
         if (activeInterestEl) {
-          activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+          if (!pinnedEls.has(activeInterestEl))
+            activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
           activeInterestEl = null;
         }
       }
@@ -564,12 +644,26 @@
     async function resolve(query) {
       const m = query.match(/^(-?\d+\.?\d*),\s*(-?\d+\.?\d*)$/);
       if (m) return [parseFloat(m[1]), parseFloat(m[2])];
+
       const params = new URLSearchParams({ q: query, format: "json", countrycodes: "jp", limit: 1 });
       const r = await fetch(`${NOMINATIM}?${params}`);
-      if (!r.ok) throw new Error(`Geocoding error ${r.status}`);
-      const results = await r.json();
-      if (!results.length) throw new Error(`No results for: ${query}`);
-      return [parseFloat(results[0].lat), parseFloat(results[0].lon)];
+      if (r.ok) {
+        const results = await r.json();
+        if (results.length) return [parseFloat(results[0].lat), parseFloat(results[0].lon)];
+      }
+
+      // Nominatim misses many Japanese street addresses — fall back to GSI geocoding API
+      const gsiParams = new URLSearchParams({ q: query });
+      const gr = await fetch(`https://msearch.gsi.go.jp/address-search/AddressSearch?${gsiParams}`);
+      if (gr.ok) {
+        const gsiResults = await gr.json();
+        if (gsiResults.length) {
+          const [lon, lat] = gsiResults[0].geometry.coordinates;
+          return [lat, lon];
+        }
+      }
+
+      throw new Error(`No results for: ${query}`);
     }
 
     function pathsToRoutes(paths, strategyIndex) {
@@ -580,12 +674,12 @@
         label:        (() => {
                         if (!path.via_poi) return j === 0 ? s.label : `${s.label} ${j + 1}`;
                         const poi = path.via_poi;
-                        const icon = poi.type === "hot_spring" ? "♨" : poi.type === "interest" ? interestEmoji : "⚡";
-                        let lbl = `${icon} ${poi.name}`;
-                        if (poi.secondary) {
-                          const icon2 = poi.secondary.type === "hot_spring" ? "♨" : poi.secondary.type === "interest" ? interestEmoji : "⚡";
-                          lbl += ` → ${icon2} ${poi.secondary.name}`;
+                        const poiIcon = t => t === "hot_spring" ? "♨" : t === "interest" ? interestEmoji : "⚡";
+                        if (poi.waypoints?.length) {
+                          return poi.waypoints.map(w => `${poiIcon(w.type)} ${w.name}`).join(" → ");
                         }
+                        let lbl = `${poiIcon(poi.type)} ${poi.name}`;
+                        if (poi.secondary) lbl += ` → ${poiIcon(poi.secondary.type)} ${poi.secondary.name}`;
                         return lbl;
                       })(),
         strategyIndex,
@@ -607,6 +701,7 @@
             poi_types: document.getElementById("show-onsens").checked
               ? ["charger", "hot_spring"] : ["charger"],
             interest: document.getElementById("interest").value.trim(),
+            pinned_stops: pinnedStops,
           }),
         });
         if (!r.ok) return;
@@ -626,7 +721,7 @@
               if (data.progress) {
                 showProgress(data.progress);
                 if (data.interest_emoji) interestEmoji = data.interest_emoji;
-                if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+                if (data.interest_pois?.length) { showInterestPOIs(data.interest_pois); restorePinnedVisuals(); }
                 if (data.candidates?.length) setCandidates(data.candidates);
               } else {
                 clearCandidates();
@@ -640,7 +735,7 @@
           if (data.progress) {
             showProgress(data.progress);
             if (data.interest_emoji) interestEmoji = data.interest_emoji;
-            if (data.interest_pois?.length) showInterestPOIs(data.interest_pois);
+            if (data.interest_pois?.length) { showInterestPOIs(data.interest_pois); restorePinnedVisuals(); }
             if (data.candidates?.length) setCandidates(data.candidates);
           } else {
             clearCandidates();
@@ -662,7 +757,7 @@
       map.fitBounds(bounds, { padding: 60 });
     }
 
-    async function getRoute({ pushHistory = true } = {}) {
+    async function getRoute({ pushHistory = true, keepPinned = false, restoredPins = null } = {}) {
       const status  = document.getElementById("status");
       const fromVal = document.getElementById("from").value.trim();
       const toVal   = document.getElementById("to").value.trim();
@@ -682,12 +777,31 @@
         charge: document.getElementById("start-charge").value,
         onsens: document.getElementById("show-onsens").checked ? "1" : "0",
         ...(interestVal ? { interest: interestVal } : {}),
+        ...(pinnedStops.length ? {
+          pins: JSON.stringify(pinnedStops.map(s => [
+            s.type,
+            parseFloat(s.lat.toFixed(5)),
+            parseFloat(s.lon.toFixed(5)),
+            s.data?.name || "",
+            s.data?.name_en || "",
+          ]))
+        } : {}),
       });
       const url = "#!" + params.toString();
       if (pushHistory) history.pushState(null, "", url);
       else history.replaceState(null, "", url);
 
+      // Reset pin visual state (purple markers back to inactive)
+      pinnedEls.forEach(el => {
+        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
+        el.dataset.pinned = "";
+      });
+      pinnedEls.clear();
+      if (!keepPinned) pinnedStops = [];
+      if (restoredPins) pinnedStops = restoredPins;
+
       clearRoutes();
+      restorePinnedVisuals(); // restore purple for charger/onsen pins already in DOM
       clearProgress();
       routes = [];
       primaryIndex = 0;

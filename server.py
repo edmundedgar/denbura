@@ -833,10 +833,11 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
             if toll:
                 total_toll += toll
 
-        # Interest POIs take visual priority; charger is primary only if no interest stop
-        primary = next((s for s in stops if s["type"] == "interest"), None)
-        if primary is None:
-            primary = next((s for s in stops if s["type"] == "charger"), stops[0])
+        # Non-pinned stops are the newly added candidates; prefer them as primary via_poi
+        non_pinned = [s for s in stops if not s.get("pinned")]
+        pool = non_pinned if non_pinned else stops
+        primary = (next((s for s in pool if s["type"] == "interest"), None)
+                   or next((s for s in pool if s["type"] == "charger"), pool[0]))
         d = primary["data"]
         via_poi: dict = {
             "type":          primary["type"],
@@ -860,6 +861,17 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
                 "lat":  sec["lat"],
                 "lon":  sec["lon"],
             }
+        # Full ordered waypoint list for multi-stop route labels
+        via_poi["waypoints"] = [
+            {
+                "type":   s["type"],
+                "name":   s["data"].get("name_en") or s["data"].get("name", ""),
+                "lat":    s["lat"],
+                "lon":    s["lon"],
+                "pinned": s.get("pinned", False),
+            }
+            for s in stops
+        ]
 
         path = {
             "points":         {"type": "LineString", "coordinates": all_lonlat},
@@ -910,6 +922,7 @@ async def route(request: Request):
     profile          = body.get("profile", "car_motorway")
     start_charge_pct = float(body.get("start_charge_pct", 80))
     poi_types        = set(body.get("poi_types", [l["type"] for l in _poi_layers]))
+    pinned_stops     = body.get("pinned_stops", [])   # [{type,lat,lon,data}] chosen by user
     start_ll   = body["points"][0]   # [lon, lat]
     end_ll     = body["points"][-1]  # [lon, lat]
     s_lat, s_lon = start_ll[1], start_ll[0]
@@ -954,50 +967,53 @@ async def route(request: Request):
             charge_need = _classify_charge_need(paths[0], start_charge_pct)
             via_tasks: list = []
 
-            # Stage 2: charger candidates near the battery sweet-spot
-            if charge_need != "none" and "charger" in poi_types:
-                sw_lat, sw_lon = _find_charge_point(
-                    paths[0], start_charge_pct, CHARGE_PREFERRED_PCT)
-                charger_clusters = _find_nearby_clusters(
-                    "charger", sw_lat, sw_lon,
-                    CHARGER_SEARCH_RADIUS_M, max_n=MAX_CHARGER_CANDIDATES)
+            if not pinned_stops:
+                # Stage 2: charger candidates near the battery sweet-spot
+                if charge_need != "none" and "charger" in poi_types:
+                    sw_lat, sw_lon = _find_charge_point(
+                        paths[0], start_charge_pct, CHARGE_PREFERRED_PCT)
+                    charger_clusters = _find_nearby_clusters(
+                        "charger", sw_lat, sw_lon,
+                        CHARGER_SEARCH_RADIUS_M, max_n=MAX_CHARGER_CANDIDATES)
 
-                for cc in charger_clusters:
-                    best_c = min(cc["members"],
-                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
-                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
-                    c_stop = {"type": "charger",
-                              "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
-                    via_tasks.append([c_stop])
+                    for cc in charger_clusters:
+                        best_c = min(cc["members"],
+                                     key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                                 + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                        c_stop = {"type": "charger",
+                                  "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
+                        via_tasks.append([c_stop])
 
-                    # Stage 3: onsens co-located with this charger
-                    if "hot_spring" in poi_types:
-                        for oc in _find_nearby_clusters(
-                                "hot_spring", best_c["lat"], best_c["lon"],
-                                NEARBY_ONSEN_RADIUS_M, max_n=MAX_NEARBY_ONSENS):
-                            best_o = min(oc["members"],
-                                         key=lambda m: _haversine_m(
-                                             best_c["lat"], best_c["lon"],
-                                             m["lat"], m["lon"]))
-                            o_stop = {"type": "hot_spring",
-                                      "lat": best_o["lat"], "lon": best_o["lon"],
-                                      "data": best_o}
-                            via_tasks.append([c_stop, o_stop])
+                        # Stage 3: onsens co-located with this charger
+                        if "hot_spring" in poi_types:
+                            for oc in _find_nearby_clusters(
+                                    "hot_spring", best_c["lat"], best_c["lon"],
+                                    NEARBY_ONSEN_RADIUS_M, max_n=MAX_NEARBY_ONSENS):
+                                best_o = min(oc["members"],
+                                             key=lambda m: _haversine_m(
+                                                 best_c["lat"], best_c["lon"],
+                                                 m["lat"], m["lon"]))
+                                o_stop = {"type": "hot_spring",
+                                          "lat": best_o["lat"], "lon": best_o["lon"],
+                                          "data": best_o}
+                                via_tasks.append([c_stop, o_stop])
 
-            # Stage 4: standalone onsens along the route corridor
-            if "hot_spring" in poi_types:
-                for oc in _corridor_clusters("hot_spring", s_lat, s_lon,
-                                              e_lat, e_lon,
-                                              max_n=MAX_CORRIDOR_ONSENS):
-                    best_o = min(oc["members"],
-                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
-                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
-                    o_stop = {"type": "hot_spring",
-                              "lat": best_o["lat"], "lon": best_o["lon"], "data": best_o}
-                    via_tasks.append([o_stop])
+                # Stage 4: standalone onsens along the route corridor
+                if "hot_spring" in poi_types:
+                    for oc in _corridor_clusters("hot_spring", s_lat, s_lon,
+                                                  e_lat, e_lon,
+                                                  max_n=MAX_CORRIDOR_ONSENS):
+                        best_o = min(oc["members"],
+                                     key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                                 + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                        o_stop = {"type": "hot_spring",
+                                  "lat": best_o["lat"], "lon": best_o["lon"], "data": best_o}
+                        via_tasks.append([o_stop])
 
-            # Stage 4b: user interest POIs along the corridor
-            all_interest_pois: list = []  # corridor candidates sent to frontend for map display
+            # Stage 4b: interest POIs (always runs; via_tasks built differently per pass)
+            all_interest_pois: list = []
+            interest_emoji = "✨"
+            corridor: list = []
             interest = body.get("interest", "").strip()
             if interest:
                 prefs = _prefectures_along_route(paths[0]["points"]["coordinates"])
@@ -1010,7 +1026,6 @@ async def route(request: Request):
                 interest_clusters = _build_clusters(interest_pois)
                 d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
                 d_max    = d_direct * INTEREST_DETOUR_RATIO
-                corridor: list = []
                 for c in interest_clusters:
                     da = _haversine_m(s_lat, s_lon, c["lat"], c["lon"])
                     db = _haversine_m(e_lat, e_lon, c["lat"], c["lon"])
@@ -1025,22 +1040,92 @@ async def route(request: Request):
                 corridor.sort()
                 for _, c in corridor:
                     all_interest_pois.extend(c["members"])
-                for _, ic in corridor[:MAX_INTEREST_CANDIDATES]:
+
+                if not pinned_stops:
+                    for _, ic in corridor[:MAX_INTEREST_CANDIDATES]:
+                        best_p = min(ic["members"],
+                                     key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
+                                                 + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
+                        p_stop = {"type": "interest",
+                                  "lat": best_p["lat"], "lon": best_p["lon"], "data": best_p}
+                        via_tasks.append([p_stop])
+                        for cc in _find_nearby_clusters("charger", best_p["lat"], best_p["lon"],
+                                                        NEARBY_INTEREST_CHARGER_M, max_n=2):
+                            best_c = min(cc["members"],
+                                         key=lambda m: _haversine_m(
+                                             best_p["lat"], best_p["lon"], m["lat"], m["lon"]))
+                            c_stop = {"type": "charger",
+                                      "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
+                            via_tasks.append([p_stop, c_stop])
+
+            if pinned_stops:
+                # Second pass: find new candidates to insert among pinned stops.
+                # pin_wp = [start, pin0, ..., pinN, end] as (lat, lon) tuples
+                pin_wp = ([(s_lat, s_lon)]
+                          + [(p["lat"], p["lon"]) for p in pinned_stops]
+                          + [(e_lat, e_lon)])
+                baseline_dist = sum(
+                    _haversine_m(pin_wp[i][0], pin_wp[i][1],
+                                 pin_wp[i+1][0], pin_wp[i+1][1])
+                    for i in range(len(pin_wp) - 1)
+                )
+                max_extra_m = baseline_dist * (INTEREST_DETOUR_RATIO - 1.0)
+                pinned_ll = {(round(p["lat"], 4), round(p["lon"], 4)) for p in pinned_stops}
+
+                def _gap_and_cost(lat: float, lon: float) -> tuple:
+                    best_gap, best_cost = 0, float("inf")
+                    for i in range(len(pin_wp) - 1):
+                        a_lat, a_lon = pin_wp[i]
+                        b_lat, b_lon = pin_wp[i + 1]
+                        cost = (_haversine_m(a_lat, a_lon, lat, lon)
+                                + _haversine_m(lat, lon, b_lat, b_lon)
+                                - _haversine_m(a_lat, a_lon, b_lat, b_lon))
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_gap = i
+                    return best_gap, best_cost
+
+                seen_new: set = set()
+
+                def _add_new(stop_type: str, lat: float, lon: float, data: dict):
+                    key = (stop_type, round(lat, 4), round(lon, 4))
+                    if key in seen_new:
+                        return
+                    if any(_haversine_m(lat, lon, pl, po) < 1000
+                           for pl, po in pinned_ll):
+                        return
+                    gap, cost = _gap_and_cost(lat, lon)
+                    if cost > max_extra_m:
+                        return
+                    seen_new.add(key)
+                    new_stop = {"type": stop_type, "lat": lat, "lon": lon,
+                                "data": data, "pinned": False}
+                    task = (
+                        [{**p, "pinned": True} for p in pinned_stops[:gap]]
+                        + [new_stop]
+                        + [{**p, "pinned": True} for p in pinned_stops[gap:]]
+                    )
+                    via_tasks.append(task)
+
+                for _, ic in corridor:
                     best_p = min(ic["members"],
-                                 key=lambda m: _haversine_m(s_lat, s_lon, m["lat"], m["lon"])
-                                             + _haversine_m(e_lat, e_lon, m["lat"], m["lon"]))
-                    p_stop = {"type": "interest",
-                              "lat": best_p["lat"], "lon": best_p["lon"], "data": best_p}
-                    via_tasks.append([p_stop])
-                    # Also try: interest POI → nearby charger
-                    for cc in _find_nearby_clusters("charger", best_p["lat"], best_p["lon"],
-                                                    NEARBY_INTEREST_CHARGER_M, max_n=2):
+                                 key=lambda m: _gap_and_cost(m["lat"], m["lon"])[1])
+                    _add_new("interest", best_p["lat"], best_p["lon"], best_p)
+
+                for i in range(len(pin_wp) - 1):
+                    a_lat, a_lon = pin_wp[i]
+                    b_lat, b_lon = pin_wp[i + 1]
+                    mid_lat = (a_lat + b_lat) / 2
+                    mid_lon = (a_lon + b_lon) / 2
+                    for cc in _find_nearby_clusters(
+                            "charger", mid_lat, mid_lon,
+                            CHARGER_SEARCH_RADIUS_M, max_n=MAX_CHARGER_CANDIDATES):
                         best_c = min(cc["members"],
-                                     key=lambda m: _haversine_m(
-                                         best_p["lat"], best_p["lon"], m["lat"], m["lon"]))
-                        c_stop = {"type": "charger",
-                                  "lat": best_c["lat"], "lon": best_c["lon"], "data": best_c}
-                        via_tasks.append([p_stop, c_stop])
+                                     key=lambda m: _gap_and_cost(m["lat"], m["lon"])[1])
+                        _add_new("charger", best_c["lat"], best_c["lon"], best_c)
+
+                # Pinned-only route (no new addition) — always first in second pass
+                via_tasks.insert(0, [{**p, "pinned": True} for p in pinned_stops])
 
             t.mark(f"Stages 2-4b: {len(via_tasks)} candidates (charge={charge_need})")
 
@@ -1050,11 +1135,14 @@ async def route(request: Request):
                 candidates: list = []
                 for stops in via_tasks:
                     for stop in stops:
+                        if stop.get("pinned"):
+                            continue  # pinned stops already shown on map
                         key = (round(stop["lat"], 5), round(stop["lon"], 5))
                         if key not in seen_coords:
                             seen_coords.add(key)
                             candidates.append({"type": stop["type"],
-                                               "lat": stop["lat"], "lon": stop["lon"]})
+                                               "lat": stop["lat"], "lon": stop["lon"],
+                                               "data": stop["data"]})
                 progress_chunk: dict = {
                     "progress": f"Finding best routes via {n} candidate stop{'s' if n != 1 else ''}…",
                     "candidates": candidates,
@@ -1076,9 +1164,11 @@ async def route(request: Request):
             for pp in poi_results:
                 if pp is None:
                     continue
+                waypoints = pp.get("via_poi", {}).get("waypoints", [])
+                all_pinned = waypoints and all(w.get("pinned", False) for w in waypoints)
                 poi_type = pp.get("via_poi", {}).get("type")
                 ratio = INTEREST_DETOUR_RATIO if poi_type == "interest" else DETOUR_MAX_RATIO
-                if pp["distance"] <= direct_dist * ratio:
+                if all_pinned or pp["distance"] <= direct_dist * ratio:
                     via_paths.append(pp)
                     if len(via_paths) >= MAX_POI_ROUTES:
                         break
