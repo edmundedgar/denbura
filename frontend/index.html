@@ -109,6 +109,7 @@
     let interestEmoji = "✨";
     let clickCycle = null; // { key: string, indices: number[], pos: number }
     let lastFocusedInput = null; // track which input was last focused for map-click-to-fill
+    let lastFrom = null, lastTo = null; // cached geocoded coords from most recent getRoute call
 
     const map = new maplibregl.Map({
       container: "map",
@@ -288,7 +289,10 @@
           el.dataset.pinned = "true";
           pinnedEls.add(el);
           pinnedStops.push({type: c.type, lat: c.lat, lon: c.lon, data: c.data});
-          getRoute({ pushHistory: true, keepPinned: true });
+          const fromVal = document.getElementById("from").value.trim();
+          const toVal   = document.getElementById("to").value.trim();
+          history.pushState(null, "", _buildHash(fromVal, toVal));
+          appendViaStopRoutes();
         });
       }
     }
@@ -757,20 +761,7 @@
       map.fitBounds(bounds, { padding: 60 });
     }
 
-    async function getRoute({ pushHistory = true, keepPinned = false, restoredPins = null } = {}) {
-      const status  = document.getElementById("status");
-      const fromVal = document.getElementById("from").value.trim();
-      const toVal   = document.getElementById("to").value.trim();
-
-      status.textContent = "Geocoding…";
-      let from, to;
-      try {
-        [from, to] = await Promise.all([resolve(fromVal), resolve(toVal)]);
-      } catch (e) {
-        status.textContent = e.message;
-        return;
-      }
-
+    function _buildHash(fromVal, toVal) {
       const interestVal = document.getElementById("interest").value.trim();
       const params = new URLSearchParams({
         from: fromVal, to: toVal,
@@ -787,7 +778,55 @@
           ]))
         } : {}),
       });
-      const url = "#!" + params.toString();
+      return "#!" + params.toString();
+    }
+
+    function _renderRouteList() {
+      document.getElementById("route-list").innerHTML = routes.map((r, i) =>
+        `<button class="route-btn${i === primaryIndex ? " active" : ""}" onclick="promote(${i})">
+           ${r.label} · ${r.summary}
+         </button>`
+      ).join("");
+    }
+
+    async function appendViaStopRoutes() {
+      if (!lastFrom || !lastTo) return;
+      const motorwayIdx = STRATEGIES.findIndex(s => s.profile === "car_motorway");
+      if (motorwayIdx < 0) return;
+      const status = document.getElementById("status");
+      await fetchStrategy(lastFrom, lastTo, motorwayIdx, (newRoutes) => {
+        const toAdd = newRoutes.filter(r => r.via_poi).slice(0, MAX_ROUTES - routes.length);
+        if (!toAdd.length) return;
+        const startIdx = routes.length;
+        routes.push(...toAdd);
+        toAdd.forEach((r, j) => {
+          const i = startIdx + j;
+          setRoute(i, r.coords);
+          styleRoute(i, false);
+        });
+        status.textContent = routes[primaryIndex].summary;
+        _renderRouteList();
+      });
+      clearProgress();
+    }
+
+    async function getRoute({ pushHistory = true, keepPinned = false, restoredPins = null } = {}) {
+      const status  = document.getElementById("status");
+      const fromVal = document.getElementById("from").value.trim();
+      const toVal   = document.getElementById("to").value.trim();
+
+      status.textContent = "Geocoding…";
+      let from, to;
+      try {
+        [from, to] = await Promise.all([resolve(fromVal), resolve(toVal)]);
+      } catch (e) {
+        status.textContent = e.message;
+        return;
+      }
+      lastFrom = from;
+      lastTo   = to;
+
+      const url = _buildHash(fromVal, toVal);
       if (pushHistory) history.pushState(null, "", url);
       else history.replaceState(null, "", url);
 
@@ -823,11 +862,7 @@
         });
         if (!fitted) { fitted = true; fitToAllRoutes(); }
         status.textContent = routes[0].summary;
-        document.getElementById("route-list").innerHTML = routes.map((r, i) =>
-          `<button class="route-btn${i === primaryIndex ? " active" : ""}" onclick="promote(${i})">
-             ${r.label} · ${r.summary}
-           </button>`
-        ).join("");
+        _renderRouteList();
       }
 
       await Promise.all(STRATEGIES.map((_, i) => fetchStrategy(from, to, i, addBatch)));
