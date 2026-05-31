@@ -326,6 +326,23 @@
       });
     }
 
+    function _pinStop(el, type, lat, lon, data) {
+      if (pinnedEls.has(el) || !lastFrom || !lastTo) return;
+      // Clean up candidate state if this element was highlighted as a candidate
+      const stale = candidateHandlers.get(el);
+      if (stale) { el.removeEventListener("click", stale); candidateHandlers.delete(el); }
+      candidateEls.delete(el);
+      candidateData.delete(el);
+      _setMarkerStyle(el, true);
+      el.dataset.pinned = "true";
+      pinnedEls.add(el);
+      pinnedStops.push({ type, lat, lon, data });
+      const fromVal = document.getElementById("from").value.trim();
+      const toVal   = document.getElementById("to").value.trim();
+      history.pushState(null, "", _buildHash(fromVal, toVal));
+      appendViaStopRoutes();
+    }
+
     function setCandidates(candidates) {
       clearCandidates();
       for (const c of candidates) {
@@ -340,22 +357,7 @@
         // Remove any stale handler from a previous setCandidates call for this same element
         const stale = candidateHandlers.get(el);
         if (stale) el.removeEventListener("click", stale);
-        const onPin = (e) => {
-          e.stopPropagation();
-          el.removeEventListener("click", onPin);
-          candidateEls.delete(el);
-          candidateData.delete(el);
-          candidateHandlers.delete(el);
-          // Promote to pinned style
-          _setMarkerStyle(el, true);
-          el.dataset.pinned = "true";
-          pinnedEls.add(el);
-          pinnedStops.push({type: c.type, lat: c.lat, lon: c.lon, data: c.data});
-          const fromVal = document.getElementById("from").value.trim();
-          const toVal   = document.getElementById("to").value.trim();
-          history.pushState(null, "", _buildHash(fromVal, toVal));
-          appendViaStopRoutes();
-        };
+        const onPin = (e) => { e.stopPropagation(); _pinStop(el, c.type, c.lat, c.lon, c.data); };
         candidateHandlers.set(el, onPin);
         el.addEventListener("click", onPin);
       }
@@ -509,6 +511,7 @@
           .setLngLat([c.lon, c.lat])
           .setPopup(new maplibregl.Popup({ maxWidth: "280px", closeButton: false, closeOnClick: false }).setHTML(lines))
           .addTo(map));
+        el.addEventListener("click", (e) => { e.stopPropagation(); _pinStop(el, "charger", c.lat, c.lon, c); });
         chargerEls.set(`${c.lat},${c.lon}`, el);
       }
     }
@@ -529,6 +532,7 @@
             .setLngLat([s.lon, s.lat])
             .setPopup(new maplibregl.Popup({ maxWidth: "280px", closeButton: false, closeOnClick: false }).setHTML(lines))
             .addTo(map));
+          el.addEventListener("click", (e) => { e.stopPropagation(); _pinStop(el, "hot_spring", s.lat, s.lon, s); });
           chargerEls.set(`${s.lat},${s.lon}`, el);
           hotSpringEls.push(el);
         }
