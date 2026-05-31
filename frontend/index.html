@@ -20,6 +20,20 @@
       border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
     }
     #controls button:hover { background: #005fa3; }
+    #interests-wrap { display: flex; flex-direction: column; gap: 3px; min-width: 210px; }
+    .interest-row { display: flex; gap: 3px; }
+    .interest-row input { flex: 1; }
+    .interest-remove {
+      padding: 4px 7px; background: #eee; color: #666;
+      border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; flex-shrink: 0;
+    }
+    .interest-remove:hover { background: #ddd; }
+    #add-interest {
+      padding: 3px 8px; background: transparent; color: #0078d4;
+      border: 1px dashed #0078d4; border-radius: 4px; cursor: pointer;
+      font-size: 12px; align-self: flex-start;
+    }
+    #add-interest:hover { background: #e8f1fb; }
     #status {
       padding: 5px 10px; background: #fff; border-bottom: 1px solid #eee;
       font-size: 13px; color: #555; flex-shrink: 0; min-height: 26px;
@@ -71,8 +85,10 @@
     <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center;cursor:pointer">
       <input type="checkbox" id="show-onsens" onchange="applyOnsenToggle()"> ♨ Onsens
     </label>
-    <input id="interest" placeholder="✨ Interests (e.g. impressive waterfalls)"
-           style="width:240px" title="Describe what you'd like to see on the way">
+    <div id="interests-wrap">
+      <div id="interests-container"></div>
+      <button id="add-interest" onclick="addInterestRow()">+ Add interest</button>
+    </div>
   </div>
   <div id="status"></div>
   <div id="progress" hidden></div>
@@ -101,6 +117,7 @@
     let activeChargerEl = null;
     const candidateEls = new Set(); // marker elements currently highlighted as route candidates
     const candidateData = new Map(); // el → {type,lat,lon,data} for click-to-pin
+    const candidateHandlers = new Map(); // el → click handler ref, so clearCandidates can remove it
     const pinnedEls = new Set();    // marker elements pinned by the user (stay purple)
     let pinnedStops = [];           // [{type,lat,lon,data}] in order
     const interestMarkers = new Map(); // "lat,lon" → MapLibre Marker (dynamic, cleared per query)
@@ -110,6 +127,42 @@
     let clickCycle = null; // { key: string, indices: number[], pos: number }
     let lastFocusedInput = null; // track which input was last focused for map-click-to-fill
     let lastFrom = null, lastTo = null; // cached geocoded coords from most recent getRoute call
+
+    function getInterestTerms() {
+      return [...document.querySelectorAll(".interest-input")]
+        .map(el => el.value.trim()).filter(Boolean);
+    }
+
+    function addInterestRow(value = "") {
+      const container = document.getElementById("interests-container");
+      const row = document.createElement("div");
+      row.className = "interest-row";
+      const inp = document.createElement("input");
+      inp.className = "interest-input";
+      inp.placeholder = "✨ e.g. impressive waterfalls";
+      inp.value = value;
+      const btn = document.createElement("button");
+      btn.className = "interest-remove";
+      btn.textContent = "×";
+      btn.title = "Remove";
+      btn.onclick = () => {
+        const rows = container.querySelectorAll(".interest-row");
+        if (rows.length <= 1) inp.value = "";
+        else row.remove();
+      };
+      row.appendChild(inp);
+      row.appendChild(btn);
+      container.appendChild(row);
+    }
+
+    function setInterestTerms(terms) {
+      const container = document.getElementById("interests-container");
+      container.innerHTML = "";
+      (terms.length ? terms : [""]).forEach(t => addInterestRow(t));
+    }
+
+    // Initialise with one blank row
+    addInterestRow();
 
     const map = new maplibregl.Map({
       container: "map",
@@ -262,10 +315,15 @@
     function clearCandidates() {
       candidateEls.forEach(el => {
         if (!pinnedEls.has(el))
-          el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
+          _setMarkerStyle(el, false);
       });
       candidateEls.clear();
       candidateData.clear();
+      // Handlers intentionally left on elements — users can still click inactive markers.
+      // candidateHandlers entries are cleaned up in setCandidates (stale removal) and onPin.
+      pinnedEls.forEach(el => {
+        _setMarkerStyle(el, true);
+      });
     }
 
     function setCandidates(candidates) {
@@ -276,16 +334,20 @@
           ? interestMarkers.get(key)?.getElement()
           : chargerEls.get(key);
         if (!el || pinnedEls.has(el)) continue;
-        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false, true).style.cssText;
+        _setMarkerStyle(el, false, true);
         candidateEls.add(el);
         candidateData.set(el, c);
-        el.addEventListener("click", function onPin(e) {
+        // Remove any stale handler from a previous setCandidates call for this same element
+        const stale = candidateHandlers.get(el);
+        if (stale) el.removeEventListener("click", stale);
+        const onPin = (e) => {
           e.stopPropagation();
           el.removeEventListener("click", onPin);
           candidateEls.delete(el);
           candidateData.delete(el);
+          candidateHandlers.delete(el);
           // Promote to pinned style
-          el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", true).style.cssText;
+          _setMarkerStyle(el, true);
           el.dataset.pinned = "true";
           pinnedEls.add(el);
           pinnedStops.push({type: c.type, lat: c.lat, lon: c.lon, data: c.data});
@@ -293,11 +355,43 @@
           const toVal   = document.getElementById("to").value.trim();
           history.pushState(null, "", _buildHash(fromVal, toVal));
           appendViaStopRoutes();
-        });
+        };
+        candidateHandlers.set(el, onPin);
+        el.addEventListener("click", onPin);
       }
     }
 
     function makeInterestMarkerEl(active) { return makePoiMarkerEl(interestEmoji, active); }
+
+    // Apply visual styles to an existing marker element by setting individual CSS properties.
+    // Never replaces style.cssText, so MapLibre's transform/position are always preserved.
+    function _setMarkerStyle(el, active, candidate = false) {
+      if (active) {
+        el.style.fontSize     = "20px";
+        el.style.background   = "rgba(255,255,255,0.92)";
+        el.style.border       = "2.5px solid rgba(100,60,180,0.9)";
+        el.style.borderRadius = "6px";
+        el.style.padding      = "2px 5px";
+        el.style.filter       = "drop-shadow(0 1px 4px rgba(0,0,0,.55))";
+        el.style.boxShadow    = "";
+      } else if (candidate) {
+        el.style.fontSize     = "18px";
+        el.style.background   = "";
+        el.style.border       = "2.5px solid rgba(220,140,0,0.9)";
+        el.style.borderRadius = "50%";
+        el.style.padding      = "3px";
+        el.style.filter       = "";
+        el.style.boxShadow    = "0 1px 4px rgba(0,0,0,.5)";
+      } else {
+        el.style.fontSize     = "15px";
+        el.style.background   = "";
+        el.style.border       = "2px solid rgba(30,30,30,0.7)";
+        el.style.borderRadius = "50%";
+        el.style.padding      = "3px";
+        el.style.filter       = "";
+        el.style.boxShadow    = "0 1px 3px rgba(0,0,0,.45)";
+      }
+    }
 
     function clearInterestMarkers() {
       if (activeInterestEl) { activeInterestEl = null; }
@@ -381,7 +475,7 @@
     function highlightActiveInterest() {
       if (activeInterestEl) {
         if (!pinnedEls.has(activeInterestEl))
-          activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+          _setMarkerStyle(activeInterestEl, false);
         activeInterestEl = null;
       }
       const poi = routes[primaryIndex]?.via_poi;
@@ -390,7 +484,7 @@
         if (m) {
           const el = m.getElement();
           if (!pinnedEls.has(el)) {
-            el.style.cssText = makeInterestMarkerEl(true).style.cssText;
+            _setMarkerStyle(el, true);
             activeInterestEl = el;
           }
         }
@@ -478,7 +572,9 @@
         document.getElementById("show-onsens").checked = p.get("onsens") === "1";
         applyOnsenToggle();
       }
-      if (p.has("interest")) document.getElementById("interest").value = p.get("interest");
+      const terms = p.getAll("interests");
+      if (!terms.length && p.has("interest")) terms.push(p.get("interest")); // old URLs
+      setInterestTerms(terms);
       const pinsParam = p.get("pins");
       if (pinsParam) {
         try {
@@ -530,11 +626,11 @@
         map.setPaintProperty(`route-${i}`, "line-opacity", 0);
       }
       if (activeChargerEl && !pinnedEls.has(activeChargerEl)) {
-        activeChargerEl.style.cssText = makePoiMarkerEl(activeChargerEl.dataset.emoji || "⚡", false).style.cssText;
+        _setMarkerStyle(activeChargerEl, false);
       }
       activeChargerEl = null;
       if (activeInterestEl && !pinnedEls.has(activeInterestEl)) {
-        activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+        _setMarkerStyle(activeInterestEl, false);
       }
       activeInterestEl = null;
       clearCandidates();
@@ -552,7 +648,7 @@
           ? interestMarkers.get(key)?.getElement()
           : chargerEls.get(key);
         if (!el || pinnedEls.has(el)) continue;
-        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", true).style.cssText;
+        _setMarkerStyle(el, true);
         el.dataset.pinned = "true";
         pinnedEls.add(el);
       }
@@ -582,12 +678,12 @@
       document.querySelectorAll(".route-btn").forEach((btn, i) => {
         btn.classList.toggle("active", i === index);
       });
-      document.getElementById("status").textContent = routes[index].summary;
+      document.getElementById("status").textContent = `${routes[index].label} · ${routes[index].summary}`;
 
       if (activeChargerEl) {
         if (!pinnedEls.has(activeChargerEl)) {
           const emoji = activeChargerEl.dataset.emoji || "⚡";
-          activeChargerEl.style.cssText = makePoiMarkerEl(emoji, false).style.cssText;
+          _setMarkerStyle(activeChargerEl, false);
         }
         activeChargerEl = null;
       }
@@ -598,20 +694,20 @@
         } else {
           if (activeInterestEl) {
             if (!pinnedEls.has(activeInterestEl))
-              activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+              _setMarkerStyle(activeInterestEl, false);
             activeInterestEl = null;
           }
           const el = chargerEls.get(`${poi.lat},${poi.lon}`);
           if (el && !pinnedEls.has(el)) {
             const emoji = el.dataset.emoji || "⚡";
-            el.style.cssText = makePoiMarkerEl(emoji, true).style.cssText;
+            _setMarkerStyle(el, true);
             activeChargerEl = el;
           }
         }
       } else {
         if (activeInterestEl) {
           if (!pinnedEls.has(activeInterestEl))
-            activeInterestEl.style.cssText = makeInterestMarkerEl(false).style.cssText;
+            _setMarkerStyle(activeInterestEl, false);
           activeInterestEl = null;
         }
       }
@@ -620,29 +716,21 @@
     function fmtTime(ms) {
       const mins = Math.round(ms / 60000);
       const h = Math.floor(mins / 60), m = mins % 60;
-      return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+      return h ? `${h}h${String(m).padStart(2, "0")}m` : `${m}m`;
     }
 
     function summarise(path) {
-      const km = (path.distance / 1000).toFixed(1);
-      const ghTime = fmtTime(path.time);
-      const timeStr = path.scored_time_ms != null
-        ? `GH ${ghTime} / GPS ${fmtTime(path.scored_time_ms)}`
-        : ghTime;
-      const tollStr = path.toll_jpy != null ? ` · ¥${path.toll_jpy.toLocaleString()}` : "";
-      let chargeStr = "";
+      const d = path.distance / 1000;
+      const km = (d >= 100 ? Math.round(d) : d.toFixed(1)) + "km";
+      const time = fmtTime(path.scored_time_ms ?? path.time);
+      const toll = path.toll_jpy != null ? ` · ¥${path.toll_jpy.toLocaleString()}` : "";
+      let charge = "";
       if (path.consumed_kwh?.length) {
         const start = parseFloat(document.getElementById("start-charge").value) || 80;
-        const dest  = Math.min(100, Math.max(0, start - path.consumed_kwh.at(-1) / EV_BATTERY_KWH * 100));
-        chargeStr = ` · →${dest.toFixed(0)}%`;
+        const dest = Math.min(100, Math.max(0, start - path.consumed_kwh.at(-1) / EV_BATTERY_KWH * 100));
+        charge = ` · →${dest.toFixed(0)}%`;
       }
-      if (path.via_poi) {
-        const p = path.via_poi;
-        const icon = p.type === "interest" ? interestEmoji : p.type === "hot_spring" ? "♨" : "⚡";
-        const extra = p.max_output ? ` ${p.max_output}` : p.description ? ` — ${p.description}` : "";
-        return `${km} km · ${timeStr}${tollStr}${chargeStr} · via ${icon} ${p.name}${extra}`;
-      }
-      return `${km} km · ${timeStr}${tollStr}${chargeStr}`;
+      return `${km} · ${time}${toll}${charge}`;
     }
 
     async function resolve(query) {
@@ -704,7 +792,7 @@
             start_charge_pct: parseFloat(document.getElementById("start-charge").value) || 80,
             poi_types: document.getElementById("show-onsens").checked
               ? ["charger", "hot_spring"] : ["charger"],
-            interest: document.getElementById("interest").value.trim(),
+            interests: getInterestTerms(),
             pinned_stops: pinnedStops,
           }),
         });
@@ -727,7 +815,7 @@
                 if (data.interest_emoji) interestEmoji = data.interest_emoji;
                 if (data.interest_pois?.length) { showInterestPOIs(data.interest_pois); restorePinnedVisuals(); }
                 if (data.candidates?.length) setCandidates(data.candidates);
-              } else {
+              } else if (data.paths) {
                 clearCandidates();
                 onBatch(pathsToRoutes(data.paths, strategyIndex));
               }
@@ -741,13 +829,14 @@
             if (data.interest_emoji) interestEmoji = data.interest_emoji;
             if (data.interest_pois?.length) { showInterestPOIs(data.interest_pois); restorePinnedVisuals(); }
             if (data.candidates?.length) setCandidates(data.candidates);
-          } else {
+          } else if (data.paths) {
             clearCandidates();
             onBatch(pathsToRoutes(data.paths, strategyIndex));
           }
         }
       } catch (e) {
-        console.warn("fetchStrategy error:", e);
+        console.error("fetchStrategy error:", e);
+        document.getElementById("status").textContent = `Error: ${e.message}`;
       }
     }
 
@@ -762,12 +851,10 @@
     }
 
     function _buildHash(fromVal, toVal) {
-      const interestVal = document.getElementById("interest").value.trim();
       const params = new URLSearchParams({
         from: fromVal, to: toVal,
         charge: document.getElementById("start-charge").value,
         onsens: document.getElementById("show-onsens").checked ? "1" : "0",
-        ...(interestVal ? { interest: interestVal } : {}),
         ...(pinnedStops.length ? {
           pins: JSON.stringify(pinnedStops.map(s => [
             s.type,
@@ -778,6 +865,7 @@
           ]))
         } : {}),
       });
+      getInterestTerms().forEach(t => params.append("interests", t));
       return "#!" + params.toString();
     }
 
@@ -795,16 +883,25 @@
       if (motorwayIdx < 0) return;
       const status = document.getElementById("status");
       await fetchStrategy(lastFrom, lastTo, motorwayIdx, (newRoutes) => {
-        const toAdd = newRoutes.filter(r => r.via_poi).slice(0, MAX_ROUTES - routes.length);
+        const toAdd = newRoutes.filter(r => r.via_poi);
         if (!toAdd.length) return;
-        const startIdx = routes.length;
-        routes.push(...toAdd);
-        toAdd.forEach((r, j) => {
-          const i = startIdx + j;
+        // Keep direct (non-via) routes; replace all existing via-POI routes with the new pinned set
+        const directRoutes = routes.filter(r => !r.via_poi);
+        const slotsAvailable = MAX_ROUTES - directRoutes.length;
+        const routesToAdd = toAdd.slice(0, slotsAvailable);
+        // Clear old via-POI map layers
+        for (let i = directRoutes.length; i < routes.length; i++) {
+          map.getSource(`route-${i}`).setData(emptyGeoJSON());
+          map.setPaintProperty(`route-${i}`, "line-opacity", 0);
+        }
+        routes = [...directRoutes, ...routesToAdd];
+        if (primaryIndex >= routes.length) primaryIndex = 0;
+        routesToAdd.forEach((r, j) => {
+          const i = directRoutes.length + j;
           setRoute(i, r.coords);
           styleRoute(i, false);
         });
-        status.textContent = routes[primaryIndex].summary;
+        status.textContent = `${routes[primaryIndex].label} · ${routes[primaryIndex].summary}`;
         _renderRouteList();
       });
       clearProgress();
@@ -832,7 +929,7 @@
 
       // Reset pin visual state (purple markers back to inactive)
       pinnedEls.forEach(el => {
-        el.style.cssText = makePoiMarkerEl(el.dataset.emoji || "⚡", false).style.cssText;
+        _setMarkerStyle(el, false);
         el.dataset.pinned = "";
       });
       pinnedEls.clear();
@@ -861,7 +958,7 @@
           styleRoute(i, i === 0);
         });
         if (!fitted) { fitted = true; fitToAllRoutes(); }
-        status.textContent = routes[0].summary;
+        status.textContent = `${routes[0].label} · ${routes[0].summary}`;
         _renderRouteList();
       }
 

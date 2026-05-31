@@ -584,7 +584,7 @@ async def _fetch_overpass_pois(osm_tags: dict, bbox: tuple) -> list:
         f"out center;"
     )
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 "https://overpass.kumi.systems/api/interpreter",
                 data={"data": query},
@@ -820,8 +820,8 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
                 stop = stops[i]
                 if stop["type"] == "charger":
                     arrival_pct = start_charge_pct - all_consumed_kwh[-1] / _EV_BATTERY_KWH * 100
-                    if arrival_pct >= CHARGE_OPTIONAL_MAX_PCT:
-                        return None   # already full; skip this stop
+                    if arrival_pct >= CHARGE_OPTIONAL_MAX_PCT and not stop.get("pinned", False):
+                        return None   # already full; skip this stop (unless user pinned it)
                     next_leg_offset = (start_charge_pct - 95.0) * _EV_BATTERY_KWH / 100.0
                 else:
                     next_leg_offset = all_consumed_kwh[-1]
@@ -884,7 +884,8 @@ async def _route_via_waypoints(client: httpx.AsyncClient, start_ll: list,
         if total_toll:
             path["toll_jpy"] = total_toll
         return path
-    except Exception:
+    except Exception as exc:
+        log.warning(f"_route_via_waypoints exception: {exc!r}")
         return None
 
 # ---------------------------------------------------------------------------
@@ -929,6 +930,8 @@ async def route(request: Request):
     e_lat, e_lon = end_ll[1],   end_ll[0]
 
     costing_opts = _PROFILE_OPTS.get(profile, _PROFILE_OPTS["car_motorway"])
+    if pinned_stops:
+        log.info(f"pinned_stops received: {[{k: v for k, v in p.items() if k != 'data'} for p in pinned_stops]}")
 
     valhalla_body = {
         "locations": [
@@ -1014,16 +1017,35 @@ async def route(request: Request):
             all_interest_pois: list = []
             interest_emoji = "✨"
             corridor: list = []
-            interest = body.get("interest", "").strip()
-            if interest:
+            raw_interests = body.get("interests") or []
+            if not raw_interests:
+                # backward-compat: single "interest" string
+                s = body.get("interest", "").strip()
+                if s:
+                    raw_interests = [s]
+            interests = [t.strip() for t in raw_interests if t.strip()]
+            if interests:
                 prefs = _prefectures_along_route(paths[0]["points"]["coordinates"])
                 log.info(f"Route prefectures: {prefs}")
-                yield json.dumps({"progress": f"Searching for {interest}…"}) + "\n"
-                interest_pois, osm_tags, interest_emoji = await _fetch_interest_pois(interest, prefs)
+                label = ", ".join(interests)
+                yield json.dumps({"progress": f"Searching for {label}…"}) + "\n"
                 bbox = _route_bbox(paths[0]["points"]["coordinates"])
-                overpass_pois = await _fetch_overpass_pois(osm_tags, bbox)
-                interest_pois = _merge_pois(interest_pois, overpass_pois)
-                interest_clusters = _build_clusters(interest_pois)
+
+                # Fetch all interest terms in parallel (each is independently cached)
+                fetch_results = await asyncio.gather(
+                    *[_fetch_interest_pois(t, prefs) for t in interests]
+                )
+                overpass_results = await asyncio.gather(
+                    *[_fetch_overpass_pois(osm_tags, bbox) for _, osm_tags, _ in fetch_results]
+                )
+
+                # Use emoji from the first term; merge all POIs into one pool
+                interest_emoji = fetch_results[0][2]
+                combined_pois: list = []
+                for (pois, _, _), overpass_pois in zip(fetch_results, overpass_results):
+                    combined_pois.extend(_merge_pois(pois, overpass_pois))
+
+                interest_clusters = _build_clusters(combined_pois)
                 d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)
                 d_max    = d_direct * INTEREST_DETOUR_RATIO
                 for c in interest_clusters:
@@ -1173,6 +1195,8 @@ async def route(request: Request):
                     if len(via_paths) >= MAX_POI_ROUTES:
                         break
             t.mark(f"filtered to {len(via_paths)} via-POI routes")
+            if pinned_stops:
+                log.info(f"pinned pass: {len(via_tasks)} tasks, {sum(1 for r in poi_results if r is not None)} non-None results, {len(via_paths)} via_paths")
 
             if via_paths:
                 yield json.dumps({"paths": via_paths}) + "\n"
