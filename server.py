@@ -545,6 +545,102 @@ async def _fetch_interest_pois(interest: str, prefectures: list = None) -> tuple
 _overpass_cache: dict = {}  # hash → list of POI dicts
 
 
+# ---------------------------------------------------------------------------
+# Wikipedia lookup cache
+# ---------------------------------------------------------------------------
+
+_WIKI_CACHE_PATH = "data/wiki_cache.json"
+_wiki_cache: dict = {}        # "lang:name" → url_string or None
+_wiki_cache_dirty = False
+
+
+def _load_wiki_cache() -> None:
+    global _wiki_cache
+    try:
+        with open(_WIKI_CACHE_PATH, encoding="utf-8") as f:
+            _wiki_cache = json.load(f)
+        log.info(f"Loaded {len(_wiki_cache)} Wikipedia cache entries")
+    except FileNotFoundError:
+        _wiki_cache = {}
+
+
+def _save_wiki_cache() -> None:
+    global _wiki_cache_dirty
+    if not _wiki_cache_dirty:
+        return
+    os.makedirs("data", exist_ok=True)
+    with open(_WIKI_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_wiki_cache, f, ensure_ascii=False, indent=2)
+    _wiki_cache_dirty = False
+
+
+def _wiki_title_matches(title: str, term: str) -> bool:
+    t, s = title.lower(), term.lower()
+    if t == s or t in s or s in t:
+        return True
+    # English: at least one significant word in common
+    t_words = {w for w in t.split() if len(w) > 2}
+    if any(w for w in s.split() if len(w) > 2 and w in t_words):
+        return True
+    # CJK: at least one 2-character sequence in common
+    for i in range(len(s) - 1):
+        if "一" <= s[i] <= "鿿" and s[i:i+2] in t:
+            return True
+    return False
+
+
+async def _wiki_lookup(client: httpx.AsyncClient, name: str, lang: str) -> str | None:
+    global _wiki_cache_dirty
+    key = f"{lang}:{name}"
+    if key in _wiki_cache:
+        return _wiki_cache[key]
+    try:
+        r = await client.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": name,
+                    "format": "json", "srlimit": 3, "srnamespace": 0},
+            timeout=8.0,
+        )
+        hits = r.json().get("query", {}).get("search", [])
+        hit = next((h for h in hits if _wiki_title_matches(h["title"], name)), None)
+        url = (f"https://{lang}.wikipedia.org/wiki/{hit['title'].replace(' ', '_')}"
+               if hit else None)
+    except Exception as e:
+        log.debug(f"Wiki lookup failed for {name!r}: {e}")
+        return None
+    _wiki_cache[key] = url
+    _wiki_cache_dirty = True
+    return url
+
+
+_WIKI_SEM = asyncio.Semaphore(5)
+
+
+async def _enrich_pois_wikipedia(pois: list) -> None:
+    """Add wikipedia URLs to POIs that don't already have one."""
+    unlinked = [p for p in pois if not p.get("wikipedia") and (p.get("name") or p.get("name_en"))]
+    if not unlinked:
+        return
+
+    async def enrich_one(poi: dict, client: httpx.AsyncClient) -> None:
+        async with _WIKI_SEM:
+            searches = []
+            if poi.get("name"):
+                searches.append((poi["name"], "ja"))
+            if poi.get("name_en") and poi.get("name_en") != poi.get("name"):
+                searches.append((poi["name_en"], "en"))
+            for name, lang in searches:
+                url = await _wiki_lookup(client, name, lang)
+                if url:
+                    poi["wikipedia"] = url
+                    return
+
+    async with httpx.AsyncClient() as client:
+        await asyncio.gather(*(enrich_one(p, client) for p in unlinked))
+
+    _save_wiki_cache()
+
+
 def _overpass_hash(osm_tags: dict, bbox: tuple) -> str:
     key = json.dumps(osm_tags, sort_keys=True) + "\n" + ",".join(f"{v:.4f}" for v in bbox)
     return hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -694,6 +790,8 @@ _poi_layers: list = [
     _load_poi_layer("charger",    "frontend/flash_chargers.json"),
     _load_poi_layer("hot_spring", "frontend/hot_springs.json"),
 ]
+
+_load_wiki_cache()
 
 # ---------------------------------------------------------------------------
 # Charge-need classification and candidate search
@@ -1044,6 +1142,8 @@ async def route(request: Request):
                 combined_pois: list = []
                 for (pois, _, _), overpass_pois in zip(fetch_results, overpass_results):
                     combined_pois.extend(_merge_pois(pois, overpass_pois))
+
+                await _enrich_pois_wikipedia(combined_pois)
 
                 interest_clusters = _build_clusters(combined_pois)
                 d_direct = _haversine_m(s_lat, s_lon, e_lat, e_lon)

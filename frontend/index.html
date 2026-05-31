@@ -82,9 +82,6 @@
       Start <input id="start-charge" type="number" min="0" max="100" value="100"
                    style="width:46px;padding:4px 4px;border:1px solid #ccc;border-radius:4px;font-size:13px;text-align:right"> %
     </label>
-    <label style="font-size:13px;color:#555;white-space:nowrap;align-self:center;cursor:pointer">
-      <input type="checkbox" id="show-onsens" onchange="applyOnsenToggle()"> ♨ Onsens
-    </label>
     <div id="interests-wrap">
       <div id="interests-container"></div>
       <button id="add-interest" onclick="addInterestRow()">+ Add interest</button>
@@ -113,7 +110,6 @@
     let primaryIndex = 0;
     let routes = []; // [{coords, label, summary, strategyIndex}]
     const chargerEls = new Map(); // "lat,lon" → marker element
-    const hotSpringEls = [];     // all hot-spring marker elements for visibility toggle
     let activeChargerEl = null;
     const candidateEls = new Set(); // marker elements currently highlighted as route candidates
     const candidateData = new Map(); // el → {type,lat,lon,data} for click-to-pin
@@ -219,7 +215,6 @@
       }
 
       loadChargers();
-      loadHotSprings();
 
       const chargeTip = new maplibregl.Popup({
         closeButton: false, closeOnClick: false, anchor: "bottom",
@@ -431,47 +426,6 @@
         interestPOIs.set(key, poi);
       }
       highlightActiveInterest();
-      enrichWithWikipedia(pois);
-    }
-
-    function _wikiTitleMatches(title, term) {
-      const t = title.toLowerCase(), s = term.toLowerCase();
-      if (t === s || t.includes(s) || s.includes(t)) return true;
-      // English: at least one significant word in common
-      const tWords = new Set(t.split(/\s+/).filter(w => w.length > 2));
-      if (s.split(/\s+/).some(w => w.length > 2 && tWords.has(w))) return true;
-      // Japanese/CJK: at least one 2-character sequence in common
-      for (let i = 0; i < s.length - 1; i++) {
-        if (/[　-鿿]/.test(s[i]) && t.includes(s.slice(i, i + 2))) return true;
-      }
-      return false;
-    }
-
-    async function enrichWithWikipedia(pois) {
-      const unlinked = pois.filter(p => !p.wikipedia && (p.name || p.name_en));
-      for (const poi of unlinked) {
-        const key = `${poi.lat},${poi.lon}`;
-        if (!interestMarkers.has(key)) continue; // markers cleared (new search started)
-        try {
-          // Try Japanese name first, fall back to English
-          const searches = [poi.name, poi.name_en].filter(Boolean);
-          let wikiUrl = null;
-          for (const term of searches) {
-            const lang = term === poi.name ? "ja" : "en";
-            const params = new URLSearchParams({ action: "query", list: "search", srsearch: term,
-              format: "json", origin: "*", srlimit: 3, srnamespace: 0 });
-            const data = await fetch(`https://${lang}.wikipedia.org/w/api.php?${params}`).then(r => r.json());
-            const hit = (data?.query?.search || []).find(h => _wikiTitleMatches(h.title, term));
-            if (hit) {
-              wikiUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(hit.title).replace(/%20/g, "_")}`;
-              break;
-            }
-          }
-          if (!wikiUrl || !interestMarkers.has(key)) continue;
-          poi.wikipedia = wikiUrl;
-          interestMarkers.get(key).getPopup().setHTML(poiPopupHTML(poi));
-        } catch (_) { /* ignore network errors */ }
-      }
     }
 
     function highlightActiveInterest() {
@@ -516,35 +470,6 @@
       }
     }
 
-    async function loadHotSprings() {
-      try {
-        const r = await fetch("hot_springs.json");
-        const springs = await r.json();
-        for (const s of springs) {
-          const el = makePoiMarkerEl("♨", false);
-          const lines = [
-            `<strong>${s.name}</strong>`,
-            s.opening_hours ? `営業: ${s.opening_hours}` : null,
-            s.fee           ? `料金: ${s.fee}` : null,
-            s.website       ? `<a href="${s.website}" target="_blank">website</a>` : null,
-          ].filter(Boolean).join("<br>");
-          hoverPopup(new maplibregl.Marker({ element: el })
-            .setLngLat([s.lon, s.lat])
-            .setPopup(new maplibregl.Popup({ maxWidth: "280px", closeButton: false, closeOnClick: false }).setHTML(lines))
-            .addTo(map));
-          el.addEventListener("click", (e) => { e.stopPropagation(); _pinStop(el, "hot_spring", s.lat, s.lon, s); });
-          chargerEls.set(`${s.lat},${s.lon}`, el);
-          hotSpringEls.push(el);
-        }
-        applyOnsenToggle();
-      } catch (e) { console.warn("hot_springs.json not found"); }
-    }
-
-    function applyOnsenToggle() {
-      const show = document.getElementById("show-onsens").checked;
-      hotSpringEls.forEach(el => { el.style.display = show ? "" : "none"; });
-    }
-
     function showProgress(msg) {
       const el = document.getElementById("progress");
       el.textContent = msg;
@@ -572,10 +497,6 @@
       document.getElementById("from").value = from;
       document.getElementById("to").value   = to;
       if (p.has("charge")) document.getElementById("start-charge").value = p.get("charge");
-      if (p.has("onsens")) {
-        document.getElementById("show-onsens").checked = p.get("onsens") === "1";
-        applyOnsenToggle();
-      }
       const terms = p.getAll("interests");
       if (!terms.length && p.has("interest")) terms.push(p.get("interest")); // old URLs
       setInterestTerms(terms);
@@ -794,8 +715,7 @@
             points: [[from[1], from[0]], [to[1], to[0]]],
             profile: s.profile,
             start_charge_pct: parseFloat(document.getElementById("start-charge").value) || 80,
-            poi_types: document.getElementById("show-onsens").checked
-              ? ["charger", "hot_spring"] : ["charger"],
+            poi_types: ["charger"],
             interests: getInterestTerms(),
             pinned_stops: pinnedStops,
           }),
@@ -858,7 +778,6 @@
       const params = new URLSearchParams({
         from: fromVal, to: toVal,
         charge: document.getElementById("start-charge").value,
-        onsens: document.getElementById("show-onsens").checked ? "1" : "0",
         ...(pinnedStops.length ? {
           pins: JSON.stringify(pinnedStops.map(s => [
             s.type,
